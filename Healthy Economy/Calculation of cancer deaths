@@ -1,0 +1,512 @@
+import os
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+from rasterio.mask import mask
+from pathlib import Path
+from tqdm import tqdm
+import warnings
+import zipfile
+import xml.etree.ElementTree as ET
+
+warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# Data Loader
+# ============================================================================
+
+class CancerDataLoader:
+    """Cancer mortality and population data loader"""
+
+    def __init__(self, cancer_excel_path, population_tif_path, shapefile_path,
+                 continent_mapping_file=None):
+        self.cancer_excel_path = Path(cancer_excel_path)
+        self.population_tif = Path(population_tif_path)
+        self.shapefile_path = Path(shapefile_path)
+        self.continent_mapping_file = Path(continent_mapping_file) if continent_mapping_file else None
+
+    def load_cancer_mortality_rates(self):
+        """Load cancer mortality rates (per 100,000 people)"""
+        print("📊 Loading cancer mortality rate data...")
+
+        try:
+            # Manually parse Excel (to avoid format issues)
+            with zipfile.ZipFile(self.cancer_excel_path, 'r') as zip_ref:
+                # Read shared strings
+                with zip_ref.open('xl/sharedStrings.xml') as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+                    shared_strings = []
+                    for si in root.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t'):
+                        shared_strings.append(si.text if si.text else '')
+
+                # Read worksheet data
+                with zip_ref.open('xl/worksheets/sheet1.xml') as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+
+                    ns = {'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+                    rows = root.findall('.//main:row', ns)
+
+                    data = []
+                    for row in rows:
+                        row_data = []
+                        cells = row.findall('.//main:c', ns)
+                        for cell in cells:
+                            cell_type = cell.get('t')
+                            value = cell.find('.//main:v', ns)
+
+                            if value is not None and value.text:
+                                if cell_type == 's':
+                                    row_data.append(shared_strings[int(value.text)])
+                                else:
+                                    row_data.append(value.text)
+                            else:
+                                row_data.append(None)
+
+                        if row_data:
+                            data.append(row_data)
+
+            # Convert to DataFrame
+            df = pd.DataFrame(data[1:], columns=data[0])
+
+            # Clean and transform data
+            df = df.rename(columns={
+                'Population': 'Country',
+                'Alpha‑3 code': 'ISO3',
+                'ASR (World) per 100 000': 'MortalityRate_per100k'
+            })
+
+            # Convert mortality rates to numeric
+            df['MortalityRate_per100k'] = pd.to_numeric(df['MortalityRate_per100k'], errors='coerce')
+
+            # Keep only required columns
+            df = df[['Country', 'ISO3', 'MortalityRate_per100k']].copy()
+
+            # Remove null values
+            df = df.dropna(subset=['MortalityRate_per100k'])
+
+            print(f"  ✓ Successfully loaded cancer mortality data for {len(df)} countries/regions")
+            print(
+                f"  ✓ Mortality rate range: {df['MortalityRate_per100k'].min():.2f} - {df['MortalityRate_per100k'].max():.2f} per 100,000 people")
+
+            return df
+
+        except Exception as e:
+            print(f"  ❌ Failed to load cancer data: {e}")
+            raise
+
+    def load_countries(self):
+        """Load country boundary data"""
+        print("\n📍 Loading country boundary data...")
+        gdf = gpd.read_file(self.shapefile_path)
+
+        # Find country name field
+        name_fields = ['ADMIN', 'NAME', 'COUNTRY', 'NAME_EN', 'Country', 'NAME_0']
+        country_field = None
+
+        for field in name_fields:
+            if field in gdf.columns:
+                country_field = field
+                break
+
+        if country_field is None:
+            raise ValueError(f"Country name field not found! Available fields: {gdf.columns.tolist()}")
+
+        gdf = gdf.rename(columns={country_field: 'Country'})
+
+        if gdf.crs != 'EPSG:4326':
+            gdf = gdf.to_crs('EPSG:4326')
+
+        # Load continent mapping (if available)
+        if self.continent_mapping_file and self.continent_mapping_file.exists():
+            continent_df = pd.read_excel(self.continent_mapping_file)
+            continent_map = dict(zip(continent_df['country_name'], continent_df['continent']))
+
+            def get_continent(country_name):
+                # Exact match
+                if country_name in continent_map:
+                    return continent_map[country_name]
+                # Fuzzy match
+                for mapped_country, continent in continent_map.items():
+                    if country_name.lower() == mapped_country.lower():
+                        return continent
+                return 'Other'
+
+            gdf['Continent'] = gdf['Country'].apply(get_continent)
+        else:
+            gdf['Continent'] = 'Other'
+
+        print(f"  ✓ Successfully loaded {len(gdf)} countries/regions")
+
+        return gdf
+
+
+# ============================================================================
+# Cancer Death Calculator
+# ============================================================================
+
+class CancerDeathCalculator:
+    """Cancer death calculator"""
+
+    def __init__(self, cancer_df, countries_gdf, population_tif_path):
+        self.cancer_df = cancer_df
+        self.countries = countries_gdf
+        self.population_tif = Path(population_tif_path)
+
+    def match_cancer_rates_to_countries(self):
+        """Match cancer mortality rates to country boundaries"""
+        print("\n🔗 Matching cancer mortality rates to countries...")
+
+        # Create country name matching dictionary
+        cancer_dict = {}
+        for _, row in self.cancer_df.iterrows():
+            country = row['Country']
+            iso3 = row['ISO3']
+            rate = row['MortalityRate_per100k']
+
+            # Use country name and ISO3 code as keys
+            cancer_dict[country] = rate
+            if pd.notna(iso3):
+                cancer_dict[iso3] = rate
+
+        # Match to boundary file
+        matched_rates = []
+        for _, country in self.countries.iterrows():
+            country_name = country['Country']
+
+            # Try multiple matching methods
+            rate = None
+
+            # 1. Exact match on country name
+            if country_name in cancer_dict:
+                rate = cancer_dict[country_name]
+
+            # 2. Fuzzy match (case-insensitive)
+            if rate is None:
+                for cancer_country, cancer_rate in cancer_dict.items():
+                    if country_name.lower() == str(cancer_country).lower():
+                        rate = cancer_rate
+                        break
+
+            # 3. Partial match
+            if rate is None:
+                for cancer_country, cancer_rate in cancer_dict.items():
+                    if (country_name.lower() in str(cancer_country).lower() or
+                            str(cancer_country).lower() in country_name.lower()):
+                        rate = cancer_rate
+                        break
+
+            matched_rates.append(rate)
+
+        self.countries['CancerMortalityRate_per100k'] = matched_rates
+
+        matched_count = self.countries['CancerMortalityRate_per100k'].notna().sum()
+        print(f"  ✓ Successfully matched {matched_count}/{len(self.countries)} countries")
+
+        # Display unmatched countries
+        unmatched = self.countries[self.countries['CancerMortalityRate_per100k'].isna()]['Country'].tolist()
+        if unmatched:
+            print(f"  ⚠️  Unmatched countries ({len(unmatched)}):")
+            for country in unmatched[:10]:
+                print(f"     - {country}")
+            if len(unmatched) > 10:
+                print(f"     ... and {len(unmatched) - 10} more")
+
+    def calculate_deaths_by_country(self):
+        """Calculate cancer deaths for each country"""
+        print("\n💀 Calculating cancer deaths by country...")
+
+        results = []
+
+        with rasterio.open(self.population_tif) as pop_src:
+            for idx, country in tqdm(self.countries.iterrows(),
+                                     total=len(self.countries),
+                                     desc="Processing countries"):
+                try:
+                    country_name = country['Country']
+                    continent = country.get('Continent', 'Other')
+                    mortality_rate = country['CancerMortalityRate_per100k']
+
+                    # Skip if no mortality rate data
+                    if pd.isna(mortality_rate):
+                        results.append({
+                            'Country': country_name,
+                            'Continent': continent,
+                            'Total_Population': 0,
+                            'MortalityRate_per100k': None,
+                            'Estimated_Cancer_Deaths': 0
+                        })
+                        continue
+
+                    # Clip population raster to country boundary
+                    geom = [country.geometry.__geo_interface__]
+                    pop_data, pop_transform = mask(pop_src, geom, crop=True, nodata=-9999)
+                    pop_data = pop_data[0]
+
+                    # Identify valid population data
+                    valid_mask = (pop_data != -9999) & np.isfinite(pop_data) & (pop_data >= 0)
+
+                    # Calculate total population
+                    total_population = np.sum(pop_data[valid_mask])
+
+                    # Calculate cancer deaths
+                    # Deaths = (Total population / 100,000) * Mortality rate
+                    cancer_deaths = (total_population / 100000) * mortality_rate
+
+                    results.append({
+                        'Country': country_name,
+                        'Continent': continent,
+                        'Total_Population': int(total_population),
+                        'MortalityRate_per100k': float(mortality_rate),
+                        'Estimated_Cancer_Deaths': int(round(cancer_deaths))
+                    })
+
+                except Exception as e:
+                    print(f"\n  ⚠️  Error processing {country['Country']}: {e}")
+                    results.append({
+                        'Country': country['Country'],
+                        'Continent': country.get('Continent', 'Other'),
+                        'Total_Population': 0,
+                        'MortalityRate_per100k': None,
+                        'Estimated_Cancer_Deaths': 0
+                    })
+
+        return pd.DataFrame(results)
+
+    def aggregate_by_continent(self, country_results):
+        """Aggregate results by continent"""
+        print("\n🌍 Aggregating by continent...")
+
+        # Only include countries with mortality rate data
+        valid_data = country_results[country_results['MortalityRate_per100k'].notna()]
+
+        continent_results = valid_data.groupby('Continent').agg({
+            'Total_Population': 'sum',
+            'Estimated_Cancer_Deaths': 'sum',
+            'MortalityRate_per100k': 'mean'
+        }).reset_index()
+
+        # Calculate actual mortality rate at continent level
+        continent_results['Actual_MortalityRate_per100k'] = (
+                continent_results['Estimated_Cancer_Deaths'] /
+                continent_results['Total_Population'] * 100000
+        )
+
+        continent_results = continent_results.sort_values('Estimated_Cancer_Deaths', ascending=False)
+
+        return continent_results
+
+
+# ============================================================================
+# Result Exporter
+# ============================================================================
+
+class ResultExporter:
+    """Result export class"""
+
+    def __init__(self, output_folder='./output'):
+        self.output_folder = Path(output_folder)
+        self.output_folder.mkdir(exist_ok=True)
+
+    def export_country_results(self, df, filename='country_cancer_deaths.csv'):
+        """Export country-level results"""
+        output_path = self.output_folder / filename
+
+        # Sort: descending by estimated cancer deaths
+        df_sorted = df.sort_values('Estimated_Cancer_Deaths', ascending=False)
+
+        # Format
+        df_export = df_sorted.copy()
+        df_export['Total_Population'] = df_export['Total_Population'].astype(int)
+        df_export['Estimated_Cancer_Deaths'] = df_export['Estimated_Cancer_Deaths'].astype(int)
+        df_export['MortalityRate_per100k'] = df_export['MortalityRate_per100k'].round(2)
+
+        df_export.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"  ✓ Country results saved: {output_path}")
+
+        return output_path
+
+    def export_continent_results(self, df, filename='continent_cancer_deaths.csv'):
+        """Export continent-level results"""
+        output_path = self.output_folder / filename
+
+        # Format
+        df_export = df.copy()
+        df_export['Total_Population'] = df_export['Total_Population'].astype(int)
+        df_export['Estimated_Cancer_Deaths'] = df_export['Estimated_Cancer_Deaths'].astype(int)
+        df_export['MortalityRate_per100k'] = df_export['MortalityRate_per100k'].round(2)
+        df_export['Actual_MortalityRate_per100k'] = df_export['Actual_MortalityRate_per100k'].round(2)
+
+        df_export.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"  ✓ Continent results saved: {output_path}")
+
+        return output_path
+
+    def export_summary(self, country_df, continent_df, filename='cancer_deaths_summary.csv'):
+        """Export summary statistics"""
+        output_path = self.output_folder / filename
+
+        # Calculate global statistics
+        valid_data = country_df[country_df['MortalityRate_per100k'].notna()]
+
+        global_stats = {
+            'Level': 'Global',
+            'Region': 'World',
+            'Total_Population': int(valid_data['Total_Population'].sum()),
+            'Estimated_Cancer_Deaths': int(valid_data['Estimated_Cancer_Deaths'].sum()),
+            'Average_MortalityRate_per100k': round(valid_data['MortalityRate_per100k'].mean(), 2),
+            'Actual_MortalityRate_per100k': round(
+                valid_data['Estimated_Cancer_Deaths'].sum() /
+                valid_data['Total_Population'].sum() * 100000, 2
+            ),
+            'Countries_with_Data': len(valid_data)
+        }
+
+        # Continent statistics
+        continent_stats = []
+        for _, row in continent_df.iterrows():
+            continent_stats.append({
+                'Level': 'Continent',
+                'Region': row['Continent'],
+                'Total_Population': int(row['Total_Population']),
+                'Estimated_Cancer_Deaths': int(row['Estimated_Cancer_Deaths']),
+                'Average_MortalityRate_per100k': round(row['MortalityRate_per100k'], 2),
+                'Actual_MortalityRate_per100k': round(row['Actual_MortalityRate_per100k'], 2),
+                'Countries_with_Data': len(country_df[
+                                               (country_df['Continent'] == row['Continent']) &
+                                               (country_df['MortalityRate_per100k'].notna())
+                                               ])
+            })
+
+        # Combine
+        all_stats = [global_stats] + continent_stats
+        summary_df = pd.DataFrame(all_stats)
+
+        summary_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"  ✓ Summary statistics saved: {output_path}")
+
+        return output_path
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+class CancerDeathAnalysisPipeline:
+    """Cancer death analysis pipeline"""
+
+    def __init__(self, cancer_excel_path, population_tif_path, shapefile_path,
+                 continent_mapping_file=None, output_folder='./output'):
+        self.loader = CancerDataLoader(cancer_excel_path, population_tif_path,
+                                       shapefile_path, continent_mapping_file)
+        self.exporter = ResultExporter(output_folder)
+
+    def run(self):
+        """Run complete analysis"""
+        print("=" * 70)
+        print("Global Cancer Death Calculation System")
+        print("=" * 70)
+
+        # 1. Load data
+        cancer_df = self.loader.load_cancer_mortality_rates()
+        countries_gdf = self.loader.load_countries()
+
+        # 2. Calculate cancer deaths
+        calculator = CancerDeathCalculator(cancer_df, countries_gdf,
+                                           self.loader.population_tif)
+        calculator.match_cancer_rates_to_countries()
+        country_results = calculator.calculate_deaths_by_country()
+        continent_results = calculator.aggregate_by_continent(country_results)
+
+        # 3. Export results
+        print("\n📁 Exporting results...")
+        self.exporter.export_country_results(country_results)
+        self.exporter.export_continent_results(continent_results)
+        self.exporter.export_summary(country_results, continent_results)
+
+        # 4. Display summary statistics
+        self._print_summary(country_results, continent_results)
+
+        print("\n" + "=" * 70)
+        print("✅ Analysis complete!")
+        print("=" * 70)
+
+        return {
+            'country_results': country_results,
+            'continent_results': continent_results
+        }
+
+    def _print_summary(self, country_df, continent_df):
+        """Print summary statistics"""
+        print("\n" + "=" * 70)
+        print("📊 Analysis Results Summary")
+        print("=" * 70)
+
+        # Global statistics
+        valid_data = country_df[country_df['MortalityRate_per100k'].notna()]
+        total_pop = valid_data['Total_Population'].sum()
+        total_deaths = valid_data['Estimated_Cancer_Deaths'].sum()
+        avg_rate = valid_data['MortalityRate_per100k'].mean()
+
+        print(f"\n🌏 Global Statistics:")
+        print(f"  Total Population:          {total_pop:>20,d} people")
+        print(f"  Estimated Cancer Deaths:    {total_deaths:>20,d} people")
+        print(f"  Average Mortality Rate:     {avg_rate:>20.2f} per 100,000")
+        print(f"  Countries with Data:        {len(valid_data):>20d}")
+
+        # Continent statistics
+        print(f"\n🌍 Cancer Deaths by Continent:")
+        print("-" * 70)
+        print(f"{'Continent':<15} {'Population':>15} {'Deaths':>15} {'Mortality':>12}")
+        print("-" * 70)
+        for _, row in continent_df.iterrows():
+            print(f"{row['Continent']:<15} {row['Total_Population']:>15,d} "
+                  f"{row['Estimated_Cancer_Deaths']:>15,d} "
+                  f"{row['Actual_MortalityRate_per100k']:>12.2f}")
+        print("-" * 70)
+
+        # TOP 10 countries
+        print(f"\n🏆 Top 10 Countries by Cancer Deaths:")
+        print("-" * 70)
+        top10 = valid_data.nlargest(10, 'Estimated_Cancer_Deaths')
+        print(f"{'Rank':<5} {'Country':<20} {'Population':>15} {'Deaths':>15} {'Mortality':>12}")
+        print("-" * 70)
+        for i, (_, row) in enumerate(top10.iterrows(), 1):
+            print(f"{i:<5} {row['Country']:<20} {row['Total_Population']:>15,d} "
+                  f"{row['Estimated_Cancer_Deaths']:>15,d} "
+                  f"{row['MortalityRate_per100k']:>12.2f}")
+        print("-" * 70)
+
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+
+if __name__ == "__main__":
+    # ========== Configuration ==========
+    CANCER_EXCEL = "XXX"  # Cancer mortality Excel file
+    POPULATION_TIF = "XXX.tif"  # Population TIF file
+    SHAPEFILE = "XXX.shp"  # World boundary file
+    CONTINENT_MAPPING = "XXX.xlsx"  # Continent mapping file (optional)
+    OUTPUT_FOLDER = "XXX"
+
+    # ========== Run ==========
+    try:
+        pipeline = CancerDeathAnalysisPipeline(
+            cancer_excel_path=CANCER_EXCEL,
+            population_tif_path=POPULATION_TIF,
+            shapefile_path=SHAPEFILE,
+            continent_mapping_file=CONTINENT_MAPPING,
+            output_folder=OUTPUT_FOLDER
+        )
+
+        results = pipeline.run()
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+
+        traceback.print_exc()
