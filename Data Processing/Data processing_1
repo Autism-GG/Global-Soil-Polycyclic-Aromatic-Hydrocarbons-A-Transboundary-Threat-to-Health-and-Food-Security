@@ -1,0 +1,324 @@
+import rasterio
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+from rasterio.mask import mask
+from rasterio.windows import Window
+import os
+from rasterio.features import rasterize
+from rasterio.windows import Window
+import os
+
+# --- 1. Constants ---
+PAHS_TIF_PATH = 'XXX.tif'
+NATURAL_EARTH_PATH = 'XXX.shp'
+DEFAULT_NO_DATA = -9999
+CONTINENT_FIELD = 'CONTINENT'
+
+# Chunk processing parameters
+CHUNK_SIZE = 1024  # Size of each chunk in pixels
+
+
+# --- 2. Function definition: calculate mean by chunks ---
+
+def calculate_mean_by_chunks(tif_path, geometry, no_data_value):
+    """
+    Calculate the mean value of a specified geometry area using chunked processing.
+    Uses rasterize instead of mask(window=...).
+
+    Args:
+        tif_path: Path to the raster file
+        geometry: Geometry shape (must be in src.crs coordinate system)
+        no_data_value: NoData value
+
+    Returns:
+        Mean value of the area or np.nan
+    """
+    try:
+        with rasterio.open(tif_path) as src:
+            # 1. Get the bounds of the geometry and compute the covering window
+            bounds = geometry.bounds
+            window = src.window(*bounds)
+
+            # Convert window coordinates to integers
+            window = window.round_offsets().round_lengths()
+            width = int(window.width)
+            height = int(window.height)
+
+            # Check if the window is valid
+            if width <= 0 or height <= 0:
+                return np.nan
+
+            # 2. Calculate number of chunks
+            x_blocks = int(np.ceil(width / CHUNK_SIZE))
+            y_blocks = int(np.ceil(height / CHUNK_SIZE))
+
+            total_sum = 0
+            total_count = 0
+
+            # 3. Process chunks
+            for i in range(y_blocks):
+                for j in range(x_blocks):
+                    # Calculate row and column offsets for the current chunk in the entire raster
+                    row_off = int(window.row_off + i * CHUNK_SIZE)
+                    col_off = int(window.col_off + j * CHUNK_SIZE)
+
+                    # Calculate chunk size
+                    block_height = min(CHUNK_SIZE, int(window.row_off + height) - row_off)
+                    block_width = min(CHUNK_SIZE, int(window.col_off + width) - col_off)
+
+                    if block_height <= 0 or block_width <= 0:
+                        continue
+
+                    # Create window object
+                    block_window = Window(col_off, row_off, block_width, block_height)
+
+                    # Get transform for the current chunk
+                    block_transform = src.window_transform(block_window)
+
+                    try:
+                        # Step A: Read current chunk data (memory-friendly)
+                        block_data = src.read(1, window=block_window)
+
+                        # Step B: Rasterize the geometry to create a mask
+                        # The mask has the same shape as block_data
+                        block_mask = rasterize(
+                            [(geometry, 1)],  # Convert geometry to 1
+                            out_shape=block_data.shape,
+                            transform=block_transform,
+                            fill=0,  # Fill outside geometry with 0
+                            dtype=np.uint8
+                        )
+
+                        # Step C: Apply mask and compute statistics
+                        # Only pixels with block_mask == 1 are inside the geometry
+
+                        # Replace NoData values with NaN
+                        block_data = np.where(block_data == no_data_value, np.nan, block_data)
+
+                        # Apply mask: set pixels outside geometry to NaN
+                        block_data[block_mask == 0] = np.nan
+
+                        # Sum and count valid pixels
+                        valid_data = block_data[~np.isnan(block_data)]
+
+                        if len(valid_data) > 0:
+                            total_sum += np.sum(valid_data)
+                            total_count += len(valid_data)
+
+                    except Exception as e:
+                        # Ignore failures in individual chunk processing
+                        print(f"    Chunk ({i},{j}) processing failed: {e}")
+                        continue
+
+            if total_count > 0:
+                return total_sum / total_count
+            else:
+                return np.nan
+
+    except Exception as e:
+        print(f"❌ Chunked calculation failed: {e}")
+        return np.nan
+
+
+def calculate_paHs_averages(tif_path, shapefile_path, output_csv_path=None):
+    """
+    Calculate global and continental average PAHs concentrations and optionally output results to a CSV file.
+    """
+    # Attempt to load the GeoTIFF file
+    try:
+        src = rasterio.open(tif_path)
+        paHs_data = src.read(1)
+        no_data_value = src.nodata if src.nodata is not None else DEFAULT_NO_DATA
+        print(f"✅ PAHs TIF file loaded successfully. NoData value: {no_data_value}")
+    except Exception as e:
+        print(f"❌ Failed to load PAHs TIF file: {e}")
+        return pd.DataFrame()
+
+    # Attempt to load the Natural Earth shapefile
+    try:
+        world = gpd.read_file(shapefile_path)
+        print(f"✅ Natural Earth data loaded successfully. Available fields: {list(world.columns)}")
+
+        # Look for possible continent field names
+        continent_fields = ['CONTINENT', 'continent', 'CONTINENT_', 'region', 'REGION', 'SUBREGION']
+        continent_field_found = None
+
+        for field in continent_fields:
+            if field in world.columns:
+                continent_field_found = field
+                break
+
+        if continent_field_found:
+            print(f"📋 Using field '{continent_field_found}' for continent classification")
+            # Filter out Antarctica and oceans
+            continents_gdf = world[~world[continent_field_found].isin(['Antarctica', 'Seven seas'])].copy()
+            continents_gdf = continents_gdf.to_crs(src.crs)
+        else:
+            print("⚠️ No suitable continent field found. Will use country data to calculate continents.")
+            continents_gdf = world.to_crs(src.crs)
+            continent_field_found = 'name'
+
+    except Exception as e:
+        print(f"❌ Failed to load Natural Earth dataset: {e}")
+        continents_gdf = None
+
+    # 3. Data preprocessing and global mean calculation
+    paHs_data = np.where(paHs_data == no_data_value, np.nan, paHs_data)
+    global_mean_paHs = np.nanmean(paHs_data)
+    print(f"\n🌍 Global average PAHs concentration calculated: {global_mean_paHs:.4f}")
+
+    # 4. Calculate continental averages
+    continent_means = {}
+
+    if continents_gdf is not None and continent_field_found in continents_gdf.columns:
+        unique_continents = continents_gdf[continent_field_found].dropna().unique()
+        print(f"\n📊 Will calculate averages for the following continents/regions: {list(unique_continents)}")
+
+        for continent_name in unique_continents:
+            print(f"\n⏳ Calculating average concentration for {continent_name}...")
+
+            try:
+                # 1. Combine geometries of all countries in the current continent
+                continent_features = continents_gdf[
+                    continents_gdf[continent_field_found] == continent_name]
+
+                if len(continent_features) == 0:
+                    print(f"⚠️ No country data found for {continent_name}")
+                    continent_means[continent_name] = np.nan
+                    continue
+
+                # Process each country using chunked processing to avoid memory issues
+                country_means = []
+                country_weights = []
+
+                for idx, country in continent_features.iterrows():
+                    try:
+                        country_name = country.get('NAME', country.get('name', f'Country_{idx}'))
+                        print(f"    Processing {country_name}...")
+
+                        # Use chunked calculation method
+                        country_mean = calculate_mean_by_chunks(
+                            tif_path,
+                            country.geometry,
+                            no_data_value
+                        )
+
+                        if not np.isnan(country_mean):
+                            # Calculate country area as weight
+                            try:
+                                country_area = country.geometry.area
+                                country_means.append(country_mean)
+                                country_weights.append(country_area)
+                            except:
+                                # If area calculation fails, use equal weight
+                                country_means.append(country_mean)
+                                country_weights.append(1)
+
+                    except Exception as e:
+                        print(f"    Country processing failed: {e}")
+                        continue
+
+                if len(country_means) > 0:
+                    # Use area-weighted average
+                    weighted_mean = np.average(country_means, weights=country_weights)
+                    continent_means[continent_name] = weighted_mean
+                    print(f"✅ {continent_name} average concentration calculated: {weighted_mean:.4f} (based on {len(country_means)} countries)")
+                else:
+                    continent_means[continent_name] = np.nan
+                    print(f"⚠️ No valid data for {continent_name}")
+
+            except Exception as e:
+                print(f"❌ Failed to calculate average for {continent_name}: {e}")
+                continent_means[continent_name] = np.nan
+    else:
+        print("⚠️ Unable to obtain continent information. Only global average will be calculated.")
+
+    # Close the rasterio file
+    src.close()
+
+    # 5. Organize results into a DataFrame
+    if continent_means:
+        df_continents = pd.DataFrame(
+            list(continent_means.items()),
+            columns=['Continent', 'Average PAHs Concentration']
+        )
+    else:
+        df_continents = pd.DataFrame(columns=['Continent', 'Average PAHs Concentration'])
+
+    # Add global average row
+    global_row = pd.DataFrame([
+        ['Global', global_mean_paHs]
+    ], columns=['Continent', 'Average PAHs Concentration'])
+
+    # Combine tables
+    df_final = pd.concat([df_continents, global_row], ignore_index=True)
+
+    # If continent data exists, sort by concentration
+    if not df_continents.empty:
+        df_final = df_final.sort_values(by='Average PAHs Concentration', ascending=False)
+
+    # 6. Export to CSV
+    if output_csv_path:
+        try:
+            os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+            df_final.to_csv(output_csv_path, index=False, encoding='utf-8-sig')
+            print(f"\n🎉 Results successfully saved to: {output_csv_path}")
+        except Exception as e:
+            print(f"❌ Failed to save file: {e}")
+
+    return df_final
+
+
+# --- 7. Execution and result display ---
+
+if __name__ == "__main__":
+    OUTPUT_FILE_PATH = 'XXX.csv'
+
+    if not os.path.exists(PAHS_TIF_PATH):
+        print(f"⚠️ Error: File '{PAHS_TIF_PATH}' not found. Please check the path.")
+    else:
+        # First try using the downloaded Natural Earth data
+        if os.path.exists(NATURAL_EARTH_PATH):
+            print("📂 Using downloaded Natural Earth data...")
+            results_df = calculate_paHs_averages(
+                tif_path=PAHS_TIF_PATH,
+                shapefile_path=NATURAL_EARTH_PATH,
+                output_csv_path=OUTPUT_FILE_PATH
+            )
+        else:
+            print("⚠️ Natural Earth data file not found. Only global average will be calculated.")
+            print("💡 Please download from: https://www.naturalearthdata.com/downloads/110m-cultural-vectors/")
+
+            # Calculate only global average
+            try:
+                with rasterio.open(PAHS_TIF_PATH) as src:
+                    paHs_data = src.read(1)
+                    no_data_value = src.nodata if src.nodata is not None else DEFAULT_NO_DATA
+                    paHs_data = np.where(paHs_data == no_data_value, np.nan, paHs_data)
+                    global_mean_paHs = np.nanmean(paHs_data)
+
+                results_df = pd.DataFrame([
+                    ['Global', global_mean_paHs]
+                ], columns=['Continent', 'Average PAHs Concentration'])
+
+                # Save results
+                os.makedirs(os.path.dirname(OUTPUT_FILE_PATH), exist_ok=True)
+                results_df.to_csv(OUTPUT_FILE_PATH, index=False, encoding='utf-8-sig')
+                print(f"\n🎉 Global average saved to: {OUTPUT_FILE_PATH}")
+
+            except Exception as e:
+                print(f"❌ Calculation failed: {e}")
+                results_df = pd.DataFrame()
+
+        # Display results
+        if not results_df.empty:
+            # Format output
+            results_df['Average PAHs Concentration'] = results_df['Average PAHs Concentration'].apply(
+                lambda x: f'{float(x):.4f}' if not pd.isna(x) else 'N/A'
+            )
+
+            print("\n" + "=" * 40)
+            print("         📊 PAHs Concentration Averages        ")
+            print("=" * 40)
+            print(results_df.to_markdown(index=False))
