@@ -1,0 +1,69 @@
+# 1. Load packages
+library(ggplot2)
+library(dplyr)
+
+# 2. Prepare data
+df <- data.frame(
+  Type = c("Rice", "Maize", "Wheat", "Potato"),
+  Value = c(XXX, XXX, XXX, XXX)
+)
+df$Type <- factor(df$Type, levels = c("Potato", "Wheat", "Maize", "Rice"))
+
+# Calculate outer ring percentage positions
+df <- df %>%
+  arrange(desc(Type)) %>%
+  mutate(
+    fraction = Value / sum(Value),
+    ymax = cumsum(fraction),
+    ymin = c(0, head(ymax, n = -1))
+  )
+
+# --- Core aesthetic settings: uniform step and differentiated widths ---
+center_h     <- 2.0    # Center hole radius
+inner_ring_w <- 0.4    # Inner ring track width (thinner)
+outer_ring_w <- 0.8    # Outer ring pie chart width (thicker)
+gap_w        <- 0.4    # Consistent gap between all rings
+step         <- inner_ring_w + gap_w 
+
+# Calculate dynamic coordinates for inner ring tracks
+df <- df %>%
+  mutate(
+    track_xmin = center_h + (as.numeric(Type) - 1) * step,
+    track_xmax = track_xmin + inner_ring_w
+  )
+
+# Calculate coordinates for outermost pie chart: after last track + gap
+outer_pie_xmin <- max(df$track_xmax) + gap_w
+outer_pie_xmax <- outer_pie_xmin + outer_ring_w  # Use larger width
+
+# 3. Plot
+p <- ggplot(df) +
+  # --- Inner ring: track chart ---
+  geom_rect(aes(ymin = 0, ymax = 1, xmin = track_xmin, xmax = track_xmax), 
+            fill = "#F0F0F0", color = NA) +
+  geom_rect(aes(ymin = 0, ymax = Value / 10000, xmin = track_xmin, xmax = track_xmax, fill = Type), 
+            color = "white", linewidth = 0.2) +
+  
+  # --- Outer ring: hollow pie chart (increased thickness) ---
+  geom_rect(aes(ymin = ymin, ymax = ymax, xmin = outer_pie_xmin, xmax = outer_pie_xmax, fill = Type), 
+            color = "white", linewidth = 0.6) +
+  
+  coord_polar(theta = "y") +
+  
+  # Color settings
+  scale_fill_manual(values = c("Maize" = "#339c52",  
+                               "Rice" = "#D23028",
+                               "Wheat" = "#327BB1",  
+                               "Potato" = "#7066A7")) +
+  
+  # Adjust X-axis range to accommodate thicker outer ring
+  xlim(0, outer_pie_xmax + 0.5) + 
+  
+  # Add value labels (position automatically adjusts with inner ring width)
+  geom_text(aes(x = track_xmin + inner_ring_w/2, y = 0, label = paste0(Type, ": ", round(Value))), 
+            hjust = 1.1, size = 3, fontface = "bold") +
+  
+  theme_void() +
+  theme(legend.position = "none")
+
+print(p)
