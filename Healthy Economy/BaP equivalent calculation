@@ -1,0 +1,332 @@
+import os
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+from rasterio.mask import mask
+from pathlib import Path
+from tqdm import tqdm
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# Configuration Class
+# ============================================================================
+
+class PAHConfig:
+    """PAHs parameter configuration class"""
+
+    PAH_COMPOUNDS = {
+        'Nap': {'abbr': 'Nap', 'tef': 0.001},
+        'Acy': {'abbr': 'Acy', 'tef': 0.001},
+        'Ace': {'abbr': 'Ace', 'tef': 0.001},
+        'Flu': {'abbr': 'Flu', 'tef': 0.001},
+        'Phe': {'abbr': 'Phe', 'tef': 0.001},
+        'Ant': {'abbr': 'Ant', 'tef': 0.01},
+        'Fla': {'abbr': 'Fla', 'tef': 0.001},
+        'Pyr': {'abbr': 'Pyr', 'tef': 0.001},
+        'BaA': {'abbr': 'BaA', 'tef': 0.1},
+        'Chr': {'abbr': 'Chr', 'tef': 0.01},
+        'BbF': {'abbr': 'BbF', 'tef': 0.1},
+        'BkF': {'abbr': 'BkF', 'tef': 0.1},
+        'BaP': {'abbr': 'BaP', 'tef': 1.0},
+        'IPY': {'abbr': 'IPY', 'tef': 0.1},
+        'DBA': {'abbr': 'DBA', 'tef': 1.0},
+        'BghiP': {'abbr': 'BghiP', 'tef': 0.1}
+    }
+
+    @classmethod
+    def get_tef_dict(cls):
+        return {name: data['tef'] for name, data in cls.PAH_COMPOUNDS.items()}
+
+    @classmethod
+    def get_abbr_dict(cls):
+        return {name: data['abbr'] for name, data in cls.PAH_COMPOUNDS.items()}
+
+
+# ============================================================================
+# Data Loader
+# ============================================================================
+
+class PAHDataLoader:
+    """PAHs raster data loader"""
+
+    def __init__(self, tif_folder, shapefile_path, is_log10=True):
+        self.tif_folder = Path(tif_folder)
+        self.shapefile_path = Path(shapefile_path)
+        self.is_log10 = is_log10
+
+    def load_countries(self):
+        """Load country boundary data"""
+        print("📍 Loading country boundary data...")
+        gdf = gpd.read_file(self.shapefile_path)
+
+        # Find country name field
+        name_fields = ['ADMIN', 'NAME', 'COUNTRY', 'NAME_EN', 'Country', 'NAME_0']
+        country_field = None
+
+        for field in name_fields:
+            if field in gdf.columns:
+                country_field = field
+                break
+
+        if country_field is None:
+            raise ValueError(f"Country name field not found! Available fields: {gdf.columns.tolist()}")
+
+        gdf = gdf.rename(columns={country_field: 'Country'})
+
+        if gdf.crs != 'EPSG:4326':
+            gdf = gdf.to_crs('EPSG:4326')
+
+        print(f"  ✓ Successfully loaded {len(gdf)} countries/regions")
+        return gdf
+
+    def find_tif_files(self):
+        """Find all PAHs TIF files"""
+        print("\n📂 Searching for TIF files...")
+
+        tif_files = list(self.tif_folder.glob('*.tif')) + list(self.tif_folder.glob('*.tiff'))
+
+        if not tif_files:
+            raise FileNotFoundError(f"No TIF files found! Path: {self.tif_folder}")
+
+        matched_files = {}
+        abbr_dict = PAHConfig.get_abbr_dict()
+
+        for tif_path in tif_files:
+            filename = tif_path.stem.upper()
+
+            for pah_name, abbr in abbr_dict.items():
+                if abbr.upper() in filename or pah_name.upper().replace('[', '').replace(']', '') in filename:
+                    matched_files[pah_name] = tif_path
+                    print(f"  ✓ {pah_name}")
+                    break
+
+        return matched_files
+
+
+# ============================================================================
+# Zonal Statistics
+# ============================================================================
+
+class ZonalStatistics:
+    """Zonal statistics analysis class"""
+
+    def __init__(self, countries_gdf, tif_files_dict, is_log10=True):
+        self.countries = countries_gdf
+        self.tif_files = tif_files_dict
+        self.is_log10 = is_log10
+
+    def log10_to_linear(self, log_values):
+        """Convert log10 values to linear values"""
+        linear_values = np.copy(log_values)
+        valid_mask = np.isfinite(linear_values) & (linear_values > -900)
+        linear_values[valid_mask] = np.power(10, linear_values[valid_mask])
+        linear_values[~valid_mask] = np.nan
+        return linear_values
+
+    def calculate_zonal_stats(self):
+        """Calculate zonal statistics"""
+        print(f"\n🔬 Calculating zonal statistics...")
+
+        all_results = []
+
+        for pah_name, tif_path in tqdm(self.tif_files.items(), desc="Processing PAHs"):
+            try:
+                with rasterio.open(tif_path) as src:
+                    country_stats = []
+
+                    for idx, country in self.countries.iterrows():
+                        try:
+                            # Clip raster to country boundary
+                            geom = [country.geometry.__geo_interface__]
+                            out_image, out_transform = mask(
+                                src, geom, crop=True,
+                                nodata=src.nodata if src.nodata is not None else -9999
+                            )
+
+                            # Extract data
+                            data = out_image[0]
+
+                            # Identify valid data
+                            if src.nodata is not None:
+                                valid_mask = data != src.nodata
+                            else:
+                                valid_mask = (data > -900) & np.isfinite(data)
+
+                            valid_data = data[valid_mask]
+
+                            if len(valid_data) > 0:
+                                # Convert from log10 to linear
+                                if self.is_log10:
+                                    valid_data = self.log10_to_linear(valid_data)
+
+                                # Calculate mean
+                                valid_data_clean = valid_data[~np.isnan(valid_data)]
+                                if len(valid_data_clean) > 0:
+                                    mean_val = np.mean(valid_data_clean)
+                                else:
+                                    mean_val = np.nan
+                            else:
+                                mean_val = np.nan
+
+                            country_stats.append(mean_val)
+
+                        except Exception:
+                            country_stats.append(np.nan)
+
+                    all_results.append({
+                        'PAH': pah_name,
+                        'values': country_stats
+                    })
+
+            except Exception as e:
+                print(f"  ❌ Error processing {pah_name}: {e}")
+                all_results.append({
+                    'PAH': pah_name,
+                    'values': [np.nan] * len(self.countries)
+                })
+
+        # Build DataFrame
+        result_df = pd.DataFrame({'Country': self.countries['Country'].values})
+
+        for item in all_results:
+            result_df[item['PAH']] = item['values']
+
+        return result_df
+
+
+# ============================================================================
+# BaP Equivalent Calculator
+# ============================================================================
+
+class BaPEquivalentCalculator:
+    """BaP equivalent concentration calculator"""
+
+    def __init__(self, concentration_df, tef_dict):
+        self.conc_df = concentration_df.copy()
+        self.tef_dict = tef_dict
+
+    def calculate_bap_eq(self):
+        """Calculate BaP equivalent concentration"""
+        print("\n🧮 Calculating BaP equivalent concentrations...")
+
+        pah_columns = [col for col in self.conc_df.columns if col != 'Country']
+
+        self.conc_df['BaP_equivalent'] = 0.0
+
+        for pah_name in pah_columns:
+            if pah_name in self.tef_dict:
+                tef = self.tef_dict[pah_name]
+                self.conc_df['BaP_equivalent'] += self.conc_df[pah_name].fillna(0) * tef
+
+        return self.conc_df
+
+
+# ============================================================================
+# Result Exporter
+# ============================================================================
+
+class ResultExporter:
+    """Result export class"""
+
+    def __init__(self, output_folder='./output'):
+        self.output_folder = Path(output_folder)
+        self.output_folder.mkdir(exist_ok=True)
+
+    def export_simple_table(self, df, filename='PAHs_BaP_equivalent.csv'):
+        """Export simplified table"""
+        output_path = self.output_folder / filename
+
+        # Keep only required columns
+        simple_df = df[['Country', 'BaP_equivalent']].copy()
+        simple_df = simple_df.sort_values('BaP_equivalent', ascending=False)
+
+        simple_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"  ✓ Results saved to: {output_path}")
+
+        return output_path
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+class PAHAnalysisPipeline:
+    """Simplified analysis pipeline"""
+
+    def __init__(self, tif_folder, shapefile_path, output_folder='./output', is_log10=True):
+        self.loader = PAHDataLoader(tif_folder, shapefile_path, is_log10)
+        self.exporter = ResultExporter(output_folder)
+
+    def run(self):
+        """Run simplified analysis"""
+        print("=" * 50)
+        print("Soil PAHs Concentration by Country and BaP Equivalent Calculation")
+        print("=" * 50)
+
+        # Load data
+        countries_gdf = self.loader.load_countries()
+        tif_files = self.loader.find_tif_files()
+
+        if not tif_files:
+            raise ValueError("No PAHs TIF files found!")
+
+        # Zonal statistics
+        zonal_calc = ZonalStatistics(countries_gdf, tif_files, self.loader.is_log10)
+        conc_df = zonal_calc.calculate_zonal_stats()
+
+        # Calculate BaP equivalent
+        tef_dict = PAHConfig.get_tef_dict()
+        bap_calc = BaPEquivalentCalculator(conc_df, tef_dict)
+        result_df = bap_calc.calculate_bap_eq()
+
+        # Export simplified table
+        self.exporter.export_simple_table(result_df)
+
+        print("\n" + "=" * 50)
+        print("✅ Analysis complete!")
+        print("=" * 50)
+
+        return result_df
+
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+
+if __name__ == "__main__":
+    # ========== Configuration ==========
+    TIF_FOLDER = "XXX"  # TIF folder path
+    SHAPEFILE = "XXX.shp"  # Boundary file
+    OUTPUT_FOLDER = "XXX"
+
+    # ========== Run ==========
+    try:
+        pipeline = PAHAnalysisPipeline(
+            tif_folder=TIF_FOLDER,
+            shapefile_path=SHAPEFILE,
+            output_folder=OUTPUT_FOLDER,
+            is_log10=True
+        )
+
+        results = pipeline.run()
+
+        # Display top 10 countries by BaP equivalent
+        print("\nTop 10 countries by BaP equivalent:")
+        top10 = results[['Country', 'BaP_equivalent']].head(10)
+        print(top10.to_string(index=False))
+
+        # Statistical information
+        print(f"\nGlobal statistics:")
+        print(f"  Valid countries: {results['BaP_equivalent'].notna().sum()}")
+        print(f"  Mean BaP equivalent: {results['BaP_equivalent'].mean():.2f} ng/g")
+        print(f"  Median BaP equivalent: {results['BaP_equivalent'].median():.2f} ng/g")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+
+        traceback.print_exc()
