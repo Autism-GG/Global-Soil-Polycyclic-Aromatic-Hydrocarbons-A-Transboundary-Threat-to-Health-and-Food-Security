@@ -1,0 +1,668 @@
+import rasterio
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+from rasterio.features import rasterize
+from rasterio.windows import Window
+import os
+
+# --- 1. Constants ---
+PAHS_TIF_PATH = 'XXX.tif'
+NATURAL_EARTH_PATH = 'XXX.shp'
+DEFAULT_NO_DATA = -9999
+
+# Chunk processing parameters
+CHUNK_SIZE = 1024  # Size of each chunk in pixels
+
+# Concentration range definitions (ug/kg) - defined in log10 space
+CONCENTRATION_RANGES = {
+    '0-50': (float('-inf'), np.log10(50)),
+    '50-100': (np.log10(50), np.log10(100)),
+    '100-1000': (np.log10(100), np.log10(1000)),
+    '>1000': (np.log10(1000), float('inf'))
+}
+
+# Manual mapping between countries and continents
+# Format: {'Country Name': 'Continent Name'}
+COUNTRY_CONTINENT_MAP = {
+    # Add countries that need manual adjustment here
+    # 'Russia': 'Europe',
+    # 'Turkey': 'Asia',
+}
+
+# Manual fixes for countries missing continent information (based on your data)
+MANUAL_CONTINENT_FIXES = {
+    'Norway': 'Europe',
+    'France': 'Europe'
+}
+
+# Actual concentration ranges for reference
+ACTUAL_RANGES = {
+    '0-50': (0, 50),
+    '50-100': (50, 100),
+    '100-1000': (100, 1000),
+    '>1000': (1000, float('inf'))
+}
+
+
+def adjust_continent_by_map(country_name, original_continent, continent_map, manual_fixes):
+    """
+    Adjust country's continent based on manual mapping table
+    """
+    # First check manual fixes list
+    if country_name in manual_fixes:
+        return manual_fixes[country_name]
+
+    # Then check user-defined mapping
+    if country_name in continent_map:
+        new_continent = continent_map[country_name]
+        if new_continent != original_continent:
+            print(f"  📍 Adjustment: {country_name} from '{original_continent}' to '{new_continent}'")
+        return new_continent
+
+    return original_continent
+
+
+def get_default_continent(country_name):
+    """
+    Provide a default continent for countries without continent information
+    """
+    # Common default values based on country names
+    europe_countries = ['Serbia', 'Norway', 'Sweden', 'Germany', 'Netherlands', 'Russia',
+                        'Croatia', 'Finland', 'Greece', 'Italy', 'United Kingdom', 'France',
+                        'Åland', 'Faeroe Is.', 'Austria', 'Liechtenstein', 'Slovenia',
+                        'Hungary', 'San Marino', 'Andorra', 'Montenegro', 'Belgium',
+                        'Switzerland', 'Bosnia and Herz.', 'Slovakia', 'Czechia',
+                        'Bulgaria', 'Romania', 'Moldova', 'Ukraine', 'Estonia',
+                        'Latvia', 'Lithuania', 'Macedonia', 'Albania', 'Ireland',
+                        'Spain', 'Iceland', 'Denmark', 'Portugal', 'Belarus',
+                        'Luxembourg', 'Poland']
+
+    if country_name in europe_countries:
+        return 'Europe'
+
+    asia_countries = ['China', 'Cambodia', 'Myanmar', 'Vietnam', 'Indonesia',
+                      'Philippines', 'Japan', 'India', 'Oman', 'Kazakhstan',
+                      'Lebanon', 'Syria', 'United Arab Emirates', 'Azerbaijan',
+                      'Georgia', 'Armenia', 'Thailand', 'Kuwait', 'Iraq', 'Iran',
+                      'Hong Kong', 'Cyprus', 'Qatar', 'South Korea', 'Turkey',
+                      'Pakistan', 'Malaysia', 'Saudi Arabia', 'Bangladesh',
+                      'North Korea', 'Turkmenistan', 'Sri Lanka', 'Israel',
+                      'Palestine', 'Bhutan', 'Mongolia', 'Laos', 'Kyrgyzstan',
+                      'Tajikistan', 'Brunei', 'Nepal', 'Uzbekistan', 'Afghanistan',
+                      'Jordan', 'Yemen']
+
+    if country_name in asia_countries:
+        return 'Asia'
+
+    north_america_countries = ['Canada', 'United States of America', 'Mexico',
+                               'Panama', 'Belize', 'Greenland', 'Honduras',
+                               'Cuba', 'Bahamas', 'Dominican Rep.', 'Haiti',
+                               'El Salvador', 'Guatemala', 'Costa Rica',
+                               'Trinidad and Tobago', 'Jamaica', 'Nicaragua',
+                               'Puerto Rico']
+
+    if country_name in north_america_countries:
+        return 'North America'
+
+    south_america_countries = ['Chile', 'Ecuador', 'Venezuela', 'Brazil',
+                               'Colombia', 'Peru', 'Guyana', 'Uruguay',
+                               'Bolivia', 'Suriname', 'Paraguay', 'Argentina']
+
+    if country_name in south_america_countries:
+        return 'South America'
+
+    africa_countries = ['Botswana', 'Egypt', 'Dem. Rep. Congo', 'Chad',
+                        'Sierra Leone', 'Guinea', 'Central African Rep.',
+                        'Sudan', 'Djibouti', 'Zambia', 'Nigeria', 'Benin',
+                        'Rwanda', 'Uganda', 'Tanzania', 'Burundi', 'Ethiopia',
+                        'S. Sudan', 'Gabon', 'Ghana', "Côte d'Ivoire",
+                        'Guinea-Bissau', 'Somalia', 'Kenya', 'Cameroon',
+                        'Eq. Guinea', 'Namibia', 'Gambia', 'Togo',
+                        'Burkina Faso', 'Malawi', 'Mozambique', 'Congo',
+                        'Madagascar', 'Eritrea', 'Libya', 'South Africa',
+                        'Liberia', 'Morocco', 'Tunisia', 'Angola', 'Mali',
+                        'Zimbabwe', 'eSwatini', 'Lesotho', 'Niger',
+                        'W. Sahara', 'Algeria', 'Mauritania', 'Senegal']
+
+    if country_name in africa_countries:
+        return 'Africa'
+
+    oceania_countries = ['Fiji', 'Vanuatu', 'Australia', 'New Zealand',
+                         'New Caledonia']
+
+    if country_name in oceania_countries:
+        return 'Oceania'
+
+    return 'Unknown Continent'
+
+
+def calculate_mean_by_chunks(tif_path, geometry, no_data_value,
+                             calculate_ranges=False):
+    """
+    Calculate the mean value and concentration range percentages for a specified geometry area using chunked processing.
+    """
+    try:
+        with rasterio.open(tif_path) as src:
+            # Get the bounds of the geometry and compute the covering window
+            bounds = geometry.bounds
+            window = src.window(*bounds)
+            window = window.round_offsets().round_lengths()
+            width = int(window.width)
+            height = int(window.height)
+
+            if width <= 0 or height <= 0:
+                if calculate_ranges:
+                    return np.nan, {}
+                else:
+                    return np.nan
+
+            # Calculate number of chunks
+            x_blocks = int(np.ceil(width / CHUNK_SIZE))
+            y_blocks = int(np.ceil(height / CHUNK_SIZE))
+
+            total_sum = 0
+            total_count = 0
+
+            # Variables for concentration range statistics
+            if calculate_ranges:
+                range_counts = {key: 0 for key in CONCENTRATION_RANGES.keys()}
+                range_data_collected = False
+
+            # Process chunks
+            for i in range(y_blocks):
+                for j in range(x_blocks):
+                    # Calculate row and column offsets for the current chunk in the entire raster
+                    row_off = int(window.row_off + i * CHUNK_SIZE)
+                    col_off = int(window.col_off + j * CHUNK_SIZE)
+
+                    # Calculate chunk size
+                    block_height = min(CHUNK_SIZE, int(window.row_off + height) - row_off)
+                    block_width = min(CHUNK_SIZE, int(window.col_off + width) - col_off)
+
+                    if block_height <= 0 or block_width <= 0:
+                        continue
+
+                    # Create window object
+                    block_window = Window(col_off, row_off, block_width, block_height)
+                    block_transform = src.window_transform(block_window)
+
+                    try:
+                        # Read current chunk data
+                        block_data = src.read(1, window=block_window)
+
+                        # Rasterize the geometry to create a mask
+                        block_mask = rasterize(
+                            [(geometry, 1)],
+                            out_shape=block_data.shape,
+                            transform=block_transform,
+                            fill=0,
+                            dtype=np.uint8
+                        )
+
+                        # Apply mask and handle no-data values
+                        block_data = np.where(block_data == no_data_value, np.nan, block_data)
+                        block_data[block_mask == 0] = np.nan
+
+                        # Get valid pixels
+                        valid_mask = ~np.isnan(block_data)
+                        valid_data = block_data[valid_mask]
+
+                        if len(valid_data) > 0:
+                            # Data is already log10 values, use directly
+                            # Calculate mean (in log10 space)
+                            total_sum += np.sum(valid_data)
+                            total_count += len(valid_data)
+
+                            # Calculate concentration range percentages (in log10 space)
+                            if calculate_ranges:
+                                for range_name, (lower, upper) in CONCENTRATION_RANGES.items():
+                                    if range_name == '>1000':
+                                        count = np.sum(valid_data > lower)
+                                    elif range_name == '0-50':
+                                        # For 0-50 range, only check values less than upper bound
+                                        count = np.sum(valid_data < upper)
+                                    else:
+                                        count = np.sum((valid_data >= lower) &
+                                                       (valid_data < upper))
+                                    range_counts[range_name] += count
+                                range_data_collected = True
+
+                    except Exception as e:
+                        continue
+
+            if total_count > 0:
+                # Calculate mean (still in log10 space)
+                mean_log_value = total_sum / total_count
+
+                if calculate_ranges and range_data_collected:
+                    # Calculate percentages
+                    range_percentages = {}
+                    for range_name, count in range_counts.items():
+                        percentage = (count / total_count * 100) if total_count > 0 else 0
+                        range_percentages[f'{range_name}_percent'] = float(percentage)
+
+                    # Return log10 mean and range percentages
+                    return mean_log_value, range_percentages
+                else:
+                    if calculate_ranges:
+                        return mean_log_value, {}
+                    else:
+                        return mean_log_value
+            else:
+                if calculate_ranges:
+                    return np.nan, {}
+                else:
+                    return np.nan
+
+    except Exception as e:
+        print(f"❌ Chunked calculation failed: {e}")
+        if calculate_ranges:
+            return np.nan, {}
+        else:
+            return np.nan
+
+
+def calculate_paHs_averages(tif_path, shapefile_path, country_output_csv_path):
+    """
+    Calculate average PAHs concentrations and concentration range percentages for each country and continent.
+    """
+    # Load GeoTIFF file
+    try:
+        src = rasterio.open(tif_path)
+        no_data_value = src.nodata if src.nodata is not None else DEFAULT_NO_DATA
+        print(f"✅ PAHs TIF file loaded successfully")
+        print(f"⚠️ Note: Data is log10-transformed, range calculations will be performed in log10 space")
+    except Exception as e:
+        print(f"❌ Failed to load PAHs TIF file: {e}")
+        return
+
+    # Load Natural Earth shapefile
+    try:
+        world = gpd.read_file(shapefile_path)
+        world = world.to_crs(src.crs)
+        print(f"✅ Natural Earth data loaded successfully")
+
+        # Look for continent field
+        continent_fields = ['CONTINENT', 'continent', 'REGION']
+        continent_field = None
+        for field in continent_fields:
+            if field in world.columns:
+                continent_field = field
+                break
+
+        if continent_field:
+            print(f"Using continent field: '{continent_field}'")
+            # Filter out Antarctica and oceans
+            if 'Antarctica' in world[continent_field].values:
+                world = world[world[continent_field] != 'Antarctica']
+            if 'Seven seas' in world[continent_field].values:
+                world = world[world[continent_field] != 'Seven seas']
+        else:
+            print("⚠️ No continent field found, will use manual assignment")
+
+    except Exception as e:
+        print(f"❌ Failed to load Natural Earth dataset: {e}")
+        src.close()
+        return
+
+    # Calculate global average and concentration range percentages
+    try:
+        paHs_data = src.read(1)
+        paHs_data = np.where(paHs_data == no_data_value, np.nan, paHs_data)
+        valid_mask = ~np.isnan(paHs_data)
+
+        if np.any(valid_mask):
+            valid_data = paHs_data[valid_mask]
+
+            # Calculate mean in log10 space
+            global_mean_log = np.nanmean(valid_data)
+            # Convert to actual concentration for display
+            global_mean_actual = np.power(10, global_mean_log)
+
+            # Calculate global concentration range percentages (in log10 space)
+            global_range_counts = {}
+            for range_name, (lower, upper) in CONCENTRATION_RANGES.items():
+                if range_name == '>1000':
+                    count = np.sum(valid_data > lower)
+                elif range_name == '0-50':
+                    count = np.sum(valid_data < upper)
+                else:
+                    count = np.sum((valid_data >= lower) &
+                                   (valid_data < upper))
+                percentage = (count / len(valid_data) * 100)
+                global_range_counts[f'{range_name}_percent'] = float(percentage)
+
+            print(f"🌍 Global average PAHs concentration:")
+            print(f"  log10 value: {global_mean_log:.4f}")
+            print(f"  actual value: {global_mean_actual:.2f} ug/kg")
+            print(f"🌍 Global concentration range percentages:")
+            for range_name in CONCENTRATION_RANGES.keys():
+                print(f"  {range_name} ug/kg: {global_range_counts[f'{range_name}_percent']:.2f}%")
+        else:
+            global_mean_log = np.nan
+            global_mean_actual = np.nan
+            global_range_counts = {}
+            print("⚠️ No valid pixels in global data")
+
+    except Exception as e:
+        print(f"❌ Failed to calculate global statistics: {e}")
+        global_mean_log = np.nan
+        global_mean_actual = np.nan
+        global_range_counts = {}
+
+    # Calculate averages and range percentages for each country
+    country_results = []
+    continent_data = {}  # Store continent data for weighted average calculation
+
+    total_countries = len(world)
+    print(f"\nStarting processing of {total_countries} countries...")
+
+    # Display number of manual mappings
+    if COUNTRY_CONTINENT_MAP:
+        print(f"📋 Will apply {len(COUNTRY_CONTINENT_MAP)} manual continent mappings")
+
+    for idx, country in world.iterrows():
+        try:
+            # Get country information
+            country_name = country.get('NAME', country.get('name', f'Country_{idx}'))
+            # Ensure country_name is not None
+            if country_name is None:
+                country_name = f'Unknown_Country_{idx}'
+
+            # Get original continent information
+            if continent_field and continent_field in country:
+                original_continent = country[continent_field]
+                if pd.isna(original_continent) or original_continent == '':
+                    original_continent = 'Unknown Continent'
+            else:
+                original_continent = 'Unknown Continent'
+
+            # Apply manual continent mapping and fixes
+            continent_name = adjust_continent_by_map(
+                country_name,
+                original_continent,
+                COUNTRY_CONTINENT_MAP,
+                MANUAL_CONTINENT_FIXES
+            )
+
+            # If still unknown continent, try default assignment
+            if continent_name == 'Unknown Continent' or pd.isna(continent_name):
+                continent_name = get_default_continent(country_name)
+                if original_continent != 'Unknown Continent' and continent_name != original_continent:
+                    print(f"  🔄 Default assignment: {country_name} from '{original_continent}' to '{continent_name}'")
+
+            print(f"Processing ({idx + 1}/{total_countries}): {country_name} ({continent_name})")
+
+            # Calculate country mean and range percentages
+            country_mean_log, country_ranges = calculate_mean_by_chunks(
+                tif_path,
+                country.geometry,
+                no_data_value,
+                calculate_ranges=True
+            )
+
+            if not np.isnan(country_mean_log):
+                # Calculate country area
+                try:
+                    country_area = country.geometry.area
+                except:
+                    country_area = 0
+
+                # Convert log10 mean to actual concentration
+                country_mean_actual = np.power(10, country_mean_log)
+
+                # Prepare country result
+                country_result = {
+                    'Country Name': country_name,
+                    'Continent': continent_name,
+                    'Original Continent': original_continent if original_continent != 'Unknown Continent' else '',
+                    'Mean Concentration_log10': float(country_mean_log),
+                    'Mean Concentration_ug_kg': float(country_mean_actual),
+                    'Area': float(country_area)
+                }
+
+                # Add concentration range percentages
+                for range_key, range_percent in country_ranges.items():
+                    country_result[range_key] = range_percent
+
+                # Save country result
+                country_results.append(country_result)
+
+                # Collect data for continent statistics
+                if continent_name not in continent_data:
+                    continent_data[continent_name] = {
+                        'means_log': [],  # log10 values
+                        'means_actual': [],  # actual values
+                        'weights': [],
+                        'countries': [],
+                        'range_data': []  # Store range data for each country
+                    }
+
+                continent_data[continent_name]['means_log'].append(country_mean_log)
+                continent_data[continent_name]['means_actual'].append(country_mean_actual)
+                continent_data[continent_name]['weights'].append(country_area)
+                continent_data[continent_name]['countries'].append(country_name)
+                continent_data[continent_name]['range_data'].append({
+                    'ranges': country_ranges,
+                    'weight': country_area
+                })
+
+        except Exception as e:
+            print(f"Failed to process {country.get('NAME', f'Country_{idx}')}: {e}")
+            continue
+
+    # Close rasterio file
+    src.close()
+
+    # Create country results DataFrame
+    if country_results:
+        df_countries = pd.DataFrame(country_results)
+        print(f"\n✅ Successfully processed {len(df_countries)} countries")
+    else:
+        print("⚠️ No valid data found for any country")
+        df_countries = pd.DataFrame()
+
+    # Calculate weighted continent averages and concentration range percentages
+    continent_results = []
+    for continent_name, data in continent_data.items():
+        if data['means_log']:
+            try:
+                # Calculate weighted average concentration (using actual values for weighting)
+                weighted_mean_actual = np.average(data['means_actual'], weights=data['weights'])
+                # Convert weighted average back to log10 value
+                weighted_mean_log = np.log10(weighted_mean_actual)
+
+                # Calculate weighted average concentration range percentages
+                weighted_ranges = {}
+                for range_key in CONCENTRATION_RANGES.keys():
+                    range_col = f'{range_key}_percent'
+                    weighted_percent = np.average(
+                        [d['ranges'].get(range_col, 0) for d in data['range_data']],
+                        weights=data['weights']
+                    )
+                    weighted_ranges[range_col] = float(weighted_percent)
+
+                # Filter out None country names
+                valid_countries = [str(c) for c in data['countries'] if c is not None]
+                countries_str = ', '.join(valid_countries[:10]) + ('...' if len(valid_countries) > 10 else '')
+
+                # Prepare continent result
+                continent_result = {
+                    'Continent': continent_name,
+                    'Mean Concentration_log10': float(weighted_mean_log),
+                    'Mean Concentration_ug_kg': float(weighted_mean_actual),
+                    'Number of Countries': len(data['means_log']),
+                    'Countries Included': countries_str
+                }
+
+                # Add concentration range percentages
+                continent_result.update(weighted_ranges)
+                continent_results.append(continent_result)
+
+            except Exception as e:
+                print(f"Error calculating statistics for continent '{continent_name}': {e}")
+                # If weighted average fails, use simple average
+                try:
+                    simple_mean_log = np.mean(data['means_log'])
+                    simple_mean_actual = np.mean(data['means_actual'])
+                    simple_ranges = {}
+                    for range_key in CONCENTRATION_RANGES.keys():
+                        range_col = f'{range_key}_percent'
+                        simple_percent = np.mean([d['ranges'].get(range_col, 0) for d in data['range_data']])
+                        simple_ranges[range_col] = float(simple_percent)
+
+                    # Filter out None country names
+                    valid_countries = [str(c) for c in data['countries'] if c is not None]
+                    countries_str = ', '.join(valid_countries[:10]) + ('...' if len(valid_countries) > 10 else '')
+
+                    continent_result = {
+                        'Continent': continent_name,
+                        'Mean Concentration_log10': float(simple_mean_log),
+                        'Mean Concentration_ug_kg': float(simple_mean_actual),
+                        'Number of Countries': len(data['means_log']),
+                        'Countries Included': countries_str
+                    }
+                    continent_result.update(simple_ranges)
+                    continent_results.append(continent_result)
+                except Exception as e2:
+                    print(f"Simple average also failed: {e2}")
+                    # Skip this continent
+                    continue
+
+    # Add global average
+    if not np.isnan(global_mean_log):
+        global_result = {
+            'Continent': 'Global',
+            'Mean Concentration_log10': float(global_mean_log),
+            'Mean Concentration_ug_kg': float(global_mean_actual),
+            'Number of Countries': len(df_countries) if not df_countries.empty else 0,
+            'Countries Included': 'All countries'
+        }
+        global_result.update(global_range_counts)
+        continent_results.append(global_result)
+
+    # Create continent results DataFrame
+    df_continents = pd.DataFrame(continent_results)
+
+    # Export country results to CSV
+    if country_output_csv_path and not df_countries.empty:
+        try:
+            os.makedirs(os.path.dirname(country_output_csv_path), exist_ok=True)
+
+            # Save detailed country data
+            df_countries.to_csv(country_output_csv_path, index=False, encoding='utf-8-sig')
+            print(f"\n🎉 Country results saved to: {country_output_csv_path}")
+
+            # Save continent summary
+            continent_csv_path = country_output_csv_path.replace('.csv', '_continent_summary.csv')
+            df_continents.to_csv(continent_csv_path, index=False, encoding='utf-8-sig')
+            print(f"🎉 Continent summary saved to: {continent_csv_path}")
+
+        except Exception as e:
+            print(f"❌ Failed to save file: {e}")
+
+    return df_countries, df_continents
+
+
+# --- Main program ---
+if __name__ == "__main__":
+    COUNTRY_OUTPUT_FILE_PATH = 'XXX.csv'
+
+    if not os.path.exists(PAHS_TIF_PATH):
+        print(f"⚠️ Error: File '{PAHS_TIF_PATH}' not found. Please check the path.")
+    else:
+        if os.path.exists(NATURAL_EARTH_PATH):
+            print("📂 Using Natural Earth data...")
+            print("=" * 70)
+
+            # Display manually mapped countries
+            if COUNTRY_CONTINENT_MAP:
+                print("Countries with manually adjusted continents:")
+                for country, continent in COUNTRY_CONTINENT_MAP.items():
+                    print(f"  {country} -> {continent}")
+                print("-" * 70)
+
+            print("Concentration range divisions (calculated in log10 space):")
+            print("Actual concentration range -> log10 range")
+            for range_name, (lower, upper) in ACTUAL_RANGES.items():
+                if range_name == '>1000':
+                    log_lower = np.log10(1000)
+                    print(f"  {range_name} ug/kg: > {log_lower:.4f} (log10)")
+                elif range_name == '0-50':
+                    log_upper = np.log10(50)
+                    print(f"  {range_name} ug/kg: < {log_upper:.4f} (log10)")
+                else:
+                    log_lower = np.log10(lower)
+                    log_upper = np.log10(upper)
+                    print(f"  {range_name} ug/kg: [{log_lower:.4f}, {log_upper:.4f}) (log10)")
+            print("=" * 70)
+
+            country_df, continent_df = calculate_paHs_averages(
+                tif_path=PAHS_TIF_PATH,
+                shapefile_path=NATURAL_EARTH_PATH,
+                country_output_csv_path=COUNTRY_OUTPUT_FILE_PATH
+            )
+
+            # Display results
+            if not continent_df.empty:
+                print("\n" + "=" * 90)
+                print("                    📊 PAHs Concentration Statistics                    ")
+                print("=" * 90)
+
+                # Prepare display dataframe
+                display_df = continent_df.copy()
+
+                # Format for display
+                display_df['Mean Concentration_log10'] = display_df['Mean Concentration_log10'].apply(
+                    lambda x: f'{float(x):.4f}' if not pd.isna(x) else 'N/A'
+                )
+                display_df['Mean Concentration_ug_kg'] = display_df['Mean Concentration_ug_kg'].apply(
+                    lambda x: f'{float(x):.2f}' if not pd.isna(x) else 'N/A'
+                )
+
+                # Format percentage columns
+                for range_key in CONCENTRATION_RANGES.keys():
+                    col_name = f'{range_key}_percent'
+                    if col_name in display_df.columns:
+                        display_df[col_name] = display_df[col_name].apply(
+                            lambda x: f'{float(x):.2f}%' if not pd.isna(x) else 'N/A'
+                        )
+
+                print(display_df.to_markdown(index=False))
+
+            # Display sample country data
+            if not country_df.empty:
+                print(f"\nTotal countries processed: {len(country_df)}")
+                print("\nSample data (first 5 countries):")
+
+                # Select columns to display
+                display_cols = ['Country Name', 'Continent', 'Original Continent', 
+                               'Mean Concentration_log10', 'Mean Concentration_ug_kg']
+                for range_key in CONCENTRATION_RANGES.keys():
+                    col_name = f'{range_key}_percent'
+                    if col_name in country_df.columns:
+                        display_cols.append(col_name)
+
+                sample_df = country_df[display_cols].head(5).copy()
+
+                # Format sample data
+                sample_df['Mean Concentration_log10'] = sample_df['Mean Concentration_log10'].apply(
+                    lambda x: f'{float(x):.4f}' if not pd.isna(x) else 'N/A'
+                )
+                sample_df['Mean Concentration_ug_kg'] = sample_df['Mean Concentration_ug_kg'].apply(
+                    lambda x: f'{float(x):.2f}' if not pd.isna(x) else 'N/A'
+                )
+
+                for range_key in CONCENTRATION_RANGES.keys():
+                    col_name = f'{range_key}_percent'
+                    if col_name in sample_df.columns:
+                        sample_df[col_name] = sample_df[col_name].apply(
+                            lambda x: f'{float(x):.2f}%' if not pd.isna(x) else 'N/A'
+                        )
+
+                print(sample_df.to_markdown(index=False))
+
+        else:
+            print("⚠️ Natural Earth data file not found")
+            print("💡 Please download from: https://www.naturalearthdata.com/downloads/110m-cultural-vectors/")
