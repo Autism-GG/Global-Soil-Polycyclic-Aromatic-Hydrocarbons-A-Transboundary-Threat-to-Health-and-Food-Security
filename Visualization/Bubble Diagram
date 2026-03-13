@@ -1,0 +1,102 @@
+rm(list = ls())
+setwd("XXX")
+
+
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(viridis)
+
+data <- read.csv("completed_data.csv")
+
+# Data processing
+processed_data <- data %>%
+  # Sort by population size to prevent large bubbles from covering smaller ones
+  arrange(desc(Pop)) %>%
+  mutate(country = factor(Country, levels = unique(Country))) %>%
+  # Prepare tooltip text content
+  mutate(text = paste("Country: ", Country, 
+                      "\nPopulation: ", Pop, 
+                      "\nAF: ", AF, 
+                      "\nR_exposure: ", R_exposure, sep="")) %>%
+  # Mark key countries
+  mutate(is_key_country = Country %in% c("China", "United States of America", "India", "Russia", 
+                                         "Brazil", "Japan", "Germany", "United Kingdom",
+                                         "France", "Italy", "Canada", "Australia"))
+
+# Custom continent colors
+continent_colors <- c(
+  "Asia" = "#EB6368",      # Red
+  "Europe" = "#7b95c6",    # Blue
+  "Africa" = "#67a583",    # Green
+  "North America" = "#806DB0", # Purple
+  "South America" = "#f59c7c", # Orange
+  "Oceania" = "#fded96",   # Yellow
+  "Antarctica" = "#a45a9b" # Brown
+)
+
+p <- ggplot(data = processed_data, 
+            aes(x = R_exposure, y = AF, size = Pop, color = continent, text = text)) +
+  # Add diagonal line
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50", alpha = 1) +
+  # Plot all points first
+  geom_point(alpha = 0.7) +
+  # Add labels for key countries
+  geom_text(data = subset(processed_data, is_key_country == TRUE),
+            aes(label = Country), 
+            size = 3, 
+            vjust = -1.2,
+            hjust = 0.5,
+            color = "black",
+            check_overlap = FALSE) +
+  # Set bubble size legend - display legend
+  scale_size_continuous(
+    name = "Population\n(Millions)",
+    range = c(3, 25),
+    breaks = c(5000000, 10000000, 20000000, 100000000),
+    labels = c("5M", "10M", "20M", "100M"),
+    guide = guide_legend(
+      override.aes = list(
+        color = "gray50",
+        size = c(6, 10, 15, 25)  # Custom bubble sizes for each breakpoint
+      ),
+      order = 1
+    )
+  ) +
+  # Set continent color legend
+  scale_color_manual(
+    name = "Continent",
+    values = continent_colors,
+    guide = guide_legend(
+      override.aes = list(size = 4)
+    )
+  ) +
+  # Set x-axis to start from 0
+  scale_x_continuous(
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  # Set y-axis to start from 0
+  scale_y_continuous(
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.key = element_rect(fill = "white"),
+    legend.margin = margin(t = 0, r = 5, b = 0, l = 0),
+    legend.spacing.y = unit(0.3, "cm"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11, face = "bold"),
+    plot.margin = margin(t = 10, r = 5, b = 10, l = 10),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5)
+  ) +
+  labs(x = "R_exposure", y = "AF") +
+  ggtitle("Global Exposure Ratio by Country") +
+  coord_fixed(ratio = 1, clip = "off")
+
+p
