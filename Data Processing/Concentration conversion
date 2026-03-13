@@ -1,0 +1,72 @@
+import rasterio
+import numpy as np
+import os
+
+
+def log10_to_original_concentration(input_filepath, output_filepath):
+    """
+    Convert a log10-transformed raster file back to original concentration values and output as a new TIFF file.
+
+    Parameters:
+    input_filepath (str): Path to the input log10-transformed raster file (.tif).
+    output_filepath (str): Path to the output original concentration raster file (.tif).
+    """
+    try:
+        # 1. Open the input raster file
+        with rasterio.open(input_filepath) as src:
+            print(f"✅ Successfully opened file: {input_filepath}")
+
+            # 2. Read data as NumPy array
+            # Assuming concentration data is in the first band (band 1)
+            log10_data = src.read(1)
+
+            # 3. Get the metadata (profile) from the source file for writing the new file
+            profile = src.profile
+
+            # 4. Perform reverse transformation: original concentration = 10^(log10 concentration)
+            # Note: NoData values (if present) should be left unchanged
+
+            # Check for NoData value
+            if src.nodata is not None:
+                # Create a boolean mask marking all valid (non-NoData) data points
+                valid_mask = (log10_data != src.nodata)
+
+                # Apply 10^x transformation to valid data points
+                original_data = np.full_like(log10_data, src.nodata, dtype=profile['dtype'])
+                original_data[valid_mask] = np.power(10, log10_data[valid_mask])
+            else:
+                # If no NoData, transform the entire array
+                original_data = np.power(10, log10_data)
+
+            print("⚙️ Data transformation completed (10^x).")
+
+            # 5. Update metadata (if needed, e.g., change data type to accommodate larger values)
+            # If original concentration values are very large, you may need float64 or higher precision
+            # Here we keep the original data type unless it's an integer type, in which case we recommend using float
+            if 'int' in str(profile['dtype']).lower():
+                profile.update(dtype=rasterio.float32)
+                original_data = original_data.astype(rasterio.float32)
+
+            # 6. Write the new array to a new TIFF file
+            with rasterio.open(output_filepath, 'w', **profile) as dst:
+                # Write the first band
+                dst.write(original_data, 1)
+
+            print(f"🎉 Successfully wrote new raster file: {output_filepath}")
+
+    except rasterio.RasterioIOError as e:
+        print(f"❌ File operation failed: Ensure the input path is correct and the file is not in use. Error: {e}")
+    except Exception as e:
+        print(f"❌ An unexpected error occurred: {e}")
+
+
+# --- Usage example ---
+# Replace 'input_log10_concentration.tif' with your actual file path
+input_file = 'XXX.tif'
+output_file = 'XXX.tif'
+
+# Check if input file exists (optional but recommended)
+if not os.path.exists(input_file):
+    print(f"\n⚠️ Error: Input file '{input_file}' not found. Please change the path and try again.")
+else:
+    log10_to_original_concentration(input_file, output_file)
