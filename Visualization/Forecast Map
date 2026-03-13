@@ -1,0 +1,56 @@
+library(terra)
+library(ggplot2)
+library(sf)
+library(tidyterra)
+library(scales)      # For rescale function
+library(rnaturalearth)
+
+# Read data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+bio1_masked <- rast("XXX.tif")
+
+# Create basic graticule
+grat <- st_graticule()
+
+min_value <- 0   # Minimum value
+max_value <- 2    # Maximum value
+
+# Simplified plot
+p1 <- ggplot() +
+  geom_sf(data = world, fill = "lightgray", color = "lightgray", linewidth = 0.1) +
+  geom_spatraster(data = bio1_masked) +
+  geom_sf(data = grat, color = "darkgrey", linewidth = 0.2, alpha = 0.5) +
+  scale_fill_distiller(palette = "RdBu",
+                       limits = c(min_value, max_value),
+                       na.value = "transparent",
+                       oob = squish,
+                       name = "concentration Log10 (ug/kg)",  # Modify to your variable name
+                       guide = guide_colorbar(title.vjust = 0.8)) +
+  coord_sf(crs = "+proj=robin") +
+  theme_void() +
+  theme(legend.position = "bottom")
+
+p1
+
+# Longitude bottom labels
+labels_x2 <- grat %>%
+  filter(type == "E", degree %% 60 == 0) %>% # ← Key: only take multiples of 60
+  mutate(lab = ifelse(degree == 0, "0°",
+                      ifelse(degree > 0, paste0(degree, "°E"),
+                             paste0(-degree, "°W")))) %>%
+  {st_as_sf(st_drop_geometry(.), lwgeom::st_endpoint(.))} %>%
+  st_transform("+proj=robin")
+
+# Latitude right labels
+labels_y2 <- grat %>%
+  filter(type == "N") %>%
+  mutate(lab = ifelse(degree == 0, "0°",
+                      ifelse(degree > 0, paste0(degree, "°N"),
+                             paste0(-degree, "°S")))) %>%
+  {st_as_sf(st_drop_geometry(.), lwgeom::st_endpoint(.))} %>%
+  st_transform("+proj=robin")
+
+p2 <- p1 +
+  geom_sf_text(data = labels_x2, aes(label = lab), nudge_y = 1e6, size = 2.8) +
+  geom_sf_text(data = labels_y2, aes(label = lab), nudge_x = 2e6, size = 2.8)
+p2
