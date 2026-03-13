@@ -1,0 +1,184 @@
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from collections import defaultdict
+import math
+
+
+def calculate_pollutant_by_landuse(landuse_path, pollutant_path,
+                                   chunk_size=1000, nodata_value=-9999):
+    """
+    Calculate average pollutant concentrations for different land use types using chunked processing
+
+    Parameters:
+    landuse_path: Path to land use raster file
+    pollutant_path: Path to pollutant concentration raster file
+    chunk_size: Chunk size (number of pixels)
+    nodata_value: NoData value
+
+    Returns:
+    dict: Land use type -> pollutant statistics
+    """
+
+    # Open both raster files
+    with rasterio.open(landuse_path) as landuse_src, \
+            rasterio.open(pollutant_path) as pollutant_src:
+
+        # Check if both rasters have the same shape
+        if landuse_src.shape != pollutant_src.shape:
+            raise ValueError("The dimensions of the two raster files do not match!")
+
+        height, width = landuse_src.shape
+        transform = landuse_src.transform
+
+        # Dictionary to store statistical results
+        # Structure: {landuse_type: {'sum': total sum, 'count': count, 'values': list of values}}
+        stats = defaultdict(lambda: {'sum': 0.0, 'count': 0, 'values': []})
+
+        # Calculate number of chunks
+        n_chunks_x = math.ceil(width / chunk_size)
+        n_chunks_y = math.ceil(height / chunk_size)
+
+        print(f"Raster dimensions: {width} x {height}")
+        print(f"Chunk settings: {chunk_size} x {chunk_size}")
+        print(f"Number of chunks: {n_chunks_x} in X direction, {n_chunks_y} in Y direction")
+
+        # Process chunks
+        for chunk_y in range(n_chunks_y):
+            for chunk_x in range(n_chunks_x):
+                # Calculate current chunk window position and size
+                x_start = chunk_x * chunk_size
+                y_start = chunk_y * chunk_size
+
+                # Handle boundary conditions
+                win_width = min(chunk_size, width - x_start)
+                win_height = min(chunk_size, height - y_start)
+
+                # Create window
+                window = Window(x_start, y_start, win_width, win_height)
+
+                # Read current chunk data
+                landuse_chunk = landuse_src.read(1, window=window)
+                pollutant_chunk = pollutant_src.read(1, window=window)
+
+                # Create valid data mask (exclude no-data)
+                valid_mask = (~np.isnan(landuse_chunk)) & (~np.isnan(pollutant_chunk))
+
+                # Exclude NoData values
+                if nodata_value is not None:
+                    valid_mask = valid_mask & (landuse_chunk != nodata_value) & (pollutant_chunk != nodata_value)
+
+                # Get valid pixel land use types and pollutant concentrations
+                valid_landuse = landuse_chunk[valid_mask]
+                valid_pollutant = pollutant_chunk[valid_mask]
+
+                # Count data for current chunk
+                for landuse_type, pollutant_value in zip(valid_landuse, valid_pollutant):
+                    # Convert land use type to integer (if it's float)
+                    landuse_type = int(landuse_type) if not np.isnan(landuse_type) else landuse_type
+
+                    stats[landuse_type]['sum'] += pollutant_value
+                    stats[landuse_type]['count'] += 1
+                    stats[landuse_type]['values'].append(pollutant_value)
+
+                # Display progress
+                chunk_idx = chunk_y * n_chunks_x + chunk_x + 1
+                total_chunks = n_chunks_x * n_chunks_y
+                progress = (chunk_idx / total_chunks) * 100
+
+                if chunk_idx % 10 == 0 or chunk_idx == total_chunks:
+                    print(f"Processing progress: {chunk_idx}/{total_chunks} chunks ({progress:.1f}%)")
+
+        # Calculate statistical metrics
+        results = {}
+        for landuse_type, data in stats.items():
+            if data['count'] > 0:
+                mean_value = data['sum'] / data['count']
+                values_array = np.array(data['values'])
+
+                results[landuse_type] = {
+                    'mean': mean_value,
+                    'median': np.median(values_array),
+                    'std': np.std(values_array),
+                    'min': np.min(values_array),
+                    'max': np.max(values_array),
+                    'count': data['count'],
+                    'sum': data['sum']
+                }
+
+        return results
+
+
+def save_results_to_file(results, output_path):
+    """Save results to a file"""
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("LandUse Type,Mean,Median,Std Dev,Min,Max,Pixel Count,Sum\n")
+
+        # Sort by land use type
+        sorted_types = sorted(results.keys())
+
+        for landuse_type in sorted_types:
+            data = results[landuse_type]
+            f.write(f"{landuse_type},{data['mean']:.4f},{data['median']:.4f},"
+                    f"{data['std']:.4f},{data['min']:.4f},{data['max']:.4f},"
+                    f"{data['count']},{data['sum']:.4f}\n")
+
+
+def print_summary(results):
+    """Print statistical summary"""
+    print("\n" + "=" * 80)
+    print("Land Use Type Pollutant Concentration Statistics")
+    print("=" * 80)
+    print(f"{'Type':<10}{'Mean':<12}{'Median':<12}{'Std Dev':<12}"
+          f"{'Min':<12}{'Max':<12}{'Pixels':<10}")
+    print("-" * 80)
+
+    # Sort by land use type
+    sorted_types = sorted(results.keys())
+
+    for landuse_type in sorted_types:
+        data = results[landuse_type]
+        print(f"{landuse_type:<10}{data['mean']:<12.4f}{data['median']:<12.4f}"
+              f"{data['std']:<12.4f}{data['min']:<12.4f}{data['max']:<12.4f}"
+              f"{data['count']:<10}")
+
+
+# Main program
+if __name__ == "__main__":
+    # Set file paths
+    landuse_file = "XXX.tif"  # Replace with your land use file path
+    pollutant_file = "XXX.tif"  # Replace with your pollutant file path
+    output_file = "XXX.csv"
+
+    try:
+        # Execute calculation
+        print("Starting calculation of pollutant concentrations for different land use types...")
+        results = calculate_pollutant_by_landuse(
+            landuse_file,
+            pollutant_file,
+            chunk_size=1000,  # Adjust chunk size based on available memory
+            nodata_value=None  # Set according to your data
+        )
+
+        # Print results
+        print_summary(results)
+
+        # Save results to CSV file
+        save_results_to_file(results, output_file)
+        print(f"\nDetailed results saved to: {output_file}")
+
+        # Output basic statistics
+        print(f"\nTotal land use types analyzed: {len(results)}")
+        total_pixels = sum(data['count'] for data in results.values())
+        print(f"Total valid pixels: {total_pixels}")
+
+    except FileNotFoundError as e:
+        print(f"File error: {e}")
+        print("Please ensure the following files exist:")
+        print(f"1. Land use file: {landuse_file}")
+        print(f"2. Pollutant file: {pollutant_file}")
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        import traceback
+
+        traceback.print_exc()
