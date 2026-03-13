@@ -1,0 +1,200 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ==================== Configuration Area (Modify Only Here) ====================
+OUTPUT_DIR = "XXX"
+MC_DIR = os.path.join(OUTPUT_DIR, "mc_uncertainty")
+TRAIN_PRED_PATH = os.path.join(OUTPUT_DIR, "train_predictions.csv")
+TEST_PRED_PATH  = os.path.join(OUTPUT_DIR, "test_predictions.csv")
+
+N_MC = 5000          # Number of Monte Carlo iterations (2000-10000 are acceptable)
+N_BINS = 10          # Number of bins for prediction values to handle heteroscedasticity
+ALPHA = 0.05         # 1 - confidence level: 0.05 -> 95% interval
+RANDOM_SEED = 42
+# =================================================================================
+
+
+def _make_bins(x, n_bins=10):
+    """Create bins for continuous variables using quantiles to ensure balanced bin sizes"""
+    qs = np.linspace(0, 1, n_bins + 1)
+    edges = np.unique(np.quantile(x, qs))
+    if len(edges) <= 2:
+        edges = np.linspace(np.min(x), np.max(x) + 1e-9, n_bins + 1)
+    # Return bin indices for each sample: 0..(n_bins-1)
+    return np.clip(np.digitize(x, edges[1:-1], right=True), 0, len(edges) - 2), edges
+
+
+def monte_carlo_residual_uncertainty(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    n_mc: int = 5000,
+    n_bins: int = 10,
+    alpha: float = 0.05,
+    seed: int = 42
+):
+    """
+    Monte Carlo residual bootstrap method:
+    1) Calculate residuals on training set: residual = y_true - y_pred
+    2) Bin based on y_pred_train to create "conditional residual pools" (handles heteroscedasticity)
+    3) For each test sample, sample n_mc times from the residual pool of its corresponding bin,
+       and add to y_pred_test
+    4) Calculate quantiles to obtain prediction intervals
+    """
+    rng = np.random.default_rng(seed)
+
+    # Training residuals
+    if "residual" in train_df.columns:
+        resid = train_df["residual"].to_numpy(float)
+        ypred_train = train_df["y_pred"].to_numpy(float)
+    else:
+        resid = (train_df["y_true"] - train_df["y_pred"]).to_numpy(float)
+        ypred_train = train_df["y_pred"].to_numpy(float)
+
+    ypred_test = test_df["y_pred"].to_numpy(float)
+    ytrue_test = test_df["y_true"].to_numpy(float) if "y_true" in test_df.columns else None
+
+    # Create bins (based on training predictions)
+    train_bins, edges = _make_bins(ypred_train, n_bins=n_bins)
+
+    # Create residual pools for each bin
+    bin_resid_pools = []
+    for b in range(n_bins):
+        pool = resid[train_bins == b]
+        # Fallback: if bin has too few samples, use all residuals
+        if pool.size < 30:
+            pool = resid
+        bin_resid_pools.append(pool)
+
+    # Assign test samples to the same bin boundaries
+    test_bins = np.clip(np.digitize(ypred_test, edges[1:-1], right=True), 0, n_bins - 1)
+
+    # Sample per bin to avoid constructing a huge (n_mc x n_test) matrix
+    lower_q = alpha / 2
+    upper_q = 1 - alpha / 2
+
+    pi_lower = np.empty_like(ypred_test)
+    pi_upper = np.empty_like(ypred_test)
+    pred_mean = ypred_test.copy()
+    pred_std  = np.empty_like(ypred_test)
+
+    for b in range(n_bins):
+        idx = np.where(test_bins == b)[0]
+        if idx.size == 0:
+            continue
+
+        pool = bin_resid_pools[b]
+        # Sampling: shape = (n_mc, n_in_bin)
+        samp = rng.choice(pool, size=(n_mc, idx.size), replace=True)
+        sims = ypred_test[idx][None, :] + samp  # Add residuals
+
+        pi_lower[idx] = np.quantile(sims, lower_q, axis=0)
+        pi_upper[idx] = np.quantile(sims, upper_q, axis=0)
+        pred_std[idx] = np.std(sims, axis=0, ddof=1)
+
+    # Create results summary table
+    out = pd.DataFrame({
+        "y_pred": ypred_test,
+        "y_pi_lower": pi_lower,
+        "y_pi_upper": pi_upper,
+        "y_pred_std": pred_std
+    })
+    if ytrue_test is not None:
+        out["y_true"] = ytrue_test
+        out["covered_95"] = ((ytrue_test >= pi_lower) & (ytrue_test <= pi_upper)).astype(int)
+        out["abs_error"] = np.abs(ytrue_test - ypred_test)
+
+    summary = {}
+    if ytrue_test is not None:
+        summary["coverage_95"] = float(out["covered_95"].mean())
+        summary["mean_pi_width"] = float((out["y_pi_upper"] - out["y_pi_lower"]).mean())
+        summary["median_pi_width"] = float((out["y_pi_upper"] - out["y_pi_lower"]).median())
+        summary["mean_abs_error"] = float(out["abs_error"].mean())
+
+    return out, summary
+
+
+def main():
+    os.makedirs(MC_DIR, exist_ok=True)
+
+    if not os.path.exists(TRAIN_PRED_PATH):
+        raise FileNotFoundError(f"Training prediction file not found: {TRAIN_PRED_PATH}")
+    if not os.path.exists(TEST_PRED_PATH):
+        raise FileNotFoundError(f"Test prediction file not found: {TEST_PRED_PATH}")
+
+    train_df = pd.read_csv(TRAIN_PRED_PATH)
+    test_df  = pd.read_csv(TEST_PRED_PATH)
+
+    out, summary = monte_carlo_residual_uncertainty(
+        train_df, test_df,
+        n_mc=N_MC, n_bins=N_BINS, alpha=ALPHA, seed=RANDOM_SEED
+    )
+
+    out_path = os.path.join(MC_DIR, "test_predictions_with_pi.csv")
+    out.to_csv(out_path, index=False)
+
+    # Save summary
+    if summary:
+        summary_path = os.path.join(MC_DIR, "mc_summary.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            for k, v in summary.items():
+                f.write(f"{k}: {v}\n")
+
+    # Figure 1: Predictions vs Observations with Prediction Intervals
+    if "y_true" in out.columns:
+        n = len(out)
+        take = min(800, n)
+        rng = np.random.default_rng(RANDOM_SEED)
+        idx = rng.choice(n, size=take, replace=False)
+
+        plt.figure(figsize=(7.5, 6))
+        plt.errorbar(
+            out.loc[idx, "y_pred"],
+            out.loc[idx, "y_true"],
+            yerr=None,
+            xerr=[
+                out.loc[idx, "y_pred"] - out.loc[idx, "y_pi_lower"],
+                out.loc[idx, "y_pi_upper"] - out.loc[idx, "y_pred"],
+            ],
+            fmt="o",
+            markersize=3,
+            elinewidth=1,
+            capsize=2,
+            alpha=0.5
+        )
+        # y=x line
+        mn = min(out["y_true"].min(), out["y_pi_lower"].min())
+        mx = max(out["y_true"].max(), out["y_pi_upper"].max())
+        plt.plot([mn, mx], [mn, mx])
+        plt.xlabel("Predicted")
+        plt.ylabel("Observed")
+        plt.title("Prediction Interval (95%) via MC Residual Bootstrap")
+        plt.tight_layout()
+        plt.savefig(os.path.join(MC_DIR, "pred_vs_obs_with_pi.png"), dpi=300)
+        plt.close()
+
+        # Figure 2: Distribution of PI Widths
+        plt.figure(figsize=(7.5, 5.5))
+        widths = out["y_pi_upper"] - out["y_pi_lower"]
+        plt.hist(widths, bins=40)
+        plt.xlabel("PI width (upper - lower)")
+        plt.ylabel("Count")
+        plt.title("Distribution of 95% Prediction Interval Width")
+        plt.tight_layout()
+        plt.savefig(os.path.join(MC_DIR, "pi_width_hist.png"), dpi=300)
+        plt.close()
+
+    print("✅ Monte Carlo uncertainty analysis completed")
+    print(f"Output directory: {MC_DIR}")
+    print(f"- test_predictions_with_pi.csv")
+    if summary:
+        print(f"- mc_summary.txt")
+    print(f"- pred_vs_obs_with_pi.png / pi_width_hist.png")
+
+
+if __name__ == "__main__":
+    main()
