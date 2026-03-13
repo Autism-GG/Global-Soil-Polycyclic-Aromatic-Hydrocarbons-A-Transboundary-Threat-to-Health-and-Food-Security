@@ -1,0 +1,169 @@
+rm(list = ls())
+setwd("XXX")
+
+library(ggplot2) 
+library(ggExtra) 
+library(ggpubr) 
+library(dplyr)
+library(tidyr)
+library(ggridges)
+library(patchwork)
+#library(gghalves)
+
+data <- read.csv("predictions_vs_observed.csv")
+
+long_data <- data %>%  
+  rename(X = X_value, Y = Y_value, Group = Group)
+
+format_p_value <- function(p) {
+  if (p < 0.001) {  
+    return("< 0.001")
+    } else if (p < 0.01) { 
+      return("< 0.01")
+      } else if (p < 0.05) { 
+        return("< 0.05")
+        } else { 
+          return(paste0("= ", format(round(p,3), nsmall =3)))
+        }
+}
+
+get_density_range <- function(data, variable) {
+  densities <- data %>% 
+    group_by(Group) %>% 
+    group_map(~density(.x[[variable]], na.rm =TRUE)$y) %>% 
+    unlist()
+  return(range(densities, na.rm =TRUE)) 
+}
+
+calculate_unified_count_range <- function(data, variable_x, variable_y, bins = 20) {
+  x_counts <- data %>%
+    group_by(Group) %>%
+    group_map(~ hist(.x[[variable_x]], breaks = seq(min(data[[variable_x]]), max(data[[variable_x]]), length.out = bins + 1), plot = FALSE)$counts) %>%
+    unlist()
+  y_counts <- data %>%
+    group_by(Group) %>%
+    group_map(~ hist(.x[[variable_y]], breaks = seq(min(data[[variable_y]]), max(data[[variable_y]]), length.out = bins + 1), plot = FALSE)$counts) %>%
+    unlist()
+  max_count <- max(c(x_counts, y_counts), na.rm = TRUE) * 1.1
+  return(c(0, max_count))}
+
+# Calculate correlation coefficients
+cor_data <- long_data %>%
+  group_by(Group) %>%
+  summarize(
+    r_value = round(cor(X, Y),3), 
+    p_value_raw = cor.test(X, Y)$p.value,
+    p_value_formatted = format_p_value(p_value_raw)
+    ) %>%
+  mutate(
+    legend_label = Group, 
+    stat_label = paste0(Group,": R = ", r_value,", p ", p_value_formatted) # Final annotation text
+    )# Merge statistical results back to main data
+long_data <- long_data %>%
+  left_join(cor_data, by = "Group")
+
+# Original data range
+x_range <- range(long_data$X, na.rm = TRUE)
+y_range <- range(long_data$Y, na.rm = TRUE)
+# Function to expand range (add 10% margin)
+expand_range <- function(r) {
+  range_diff <- diff(r)
+  return(c(r[1] -0.1* range_diff,r[2] +0.1* range_diff))}
+# Final expanded ranges
+expanded_x_range <- expand_range(x_range)
+expanded_y_range <- expand_range(y_range)
+
+x_pos <- expanded_x_range[1] + 0.01 * diff(expanded_x_range) # 2% position on X axis
+n_groups <- nrow(cor_data)
+# Number of groups
+y_spacing <-0.08*diff(expanded_y_range)
+# Vertical spacing between group annotations# Assign Y-axis positions by group order (top to bottom)
+cor_data <- cor_data %>%
+  arrange(Group) %>%
+  mutate(
+    y_pos = expanded_y_range[2] - (0:(n_groups-1)) * y_spacing -0.02*diff(expanded_y_range)
+    )
+
+# 1. Main scatter plot theme (with axes, border, bold text)
+Main_theme <- theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust =0.5, face ="bold", size =16), # Centered bold title
+    axis.title = element_text(face ="bold", size =14),
+    # Bold axis labels
+    axis.text = element_text(size =12, face ="bold", color ="black"),# Bold axis ticks
+    axis.ticks = element_line(color ="black", linewidth =0.5),
+    # Axis tick lines
+    axis.ticks.length = unit(0.2,"cm"), 
+    # Tick length
+    legend.position ="none",
+    # Hide legend (annotations already include group info)
+    panel.grid.major = element_blank(),
+    # Hide major grid lines
+    panel.grid.minor = element_blank(),
+    # Hide minor grid lines
+    plot.background = element_rect(fill ="white", color = NA),
+    # White background
+    panel.border = element_rect(color ="black", fill = NA, linewidth =1) # Plot border
+    )# 2. Marginal plot theme (no axes, no grid, reduced margins)
+no_axis_theme <- theme_void() +
+  theme(
+    legend.position ="none",
+    plot.background = element_rect(fill ="white", color = NA),
+    plot.margin = margin(0,0,0,0),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+    )# 3. Color scheme (3 groups default, adjust based on number of groups)
+sci_colors <- c('#7b95c6','#ED949A')[1:length(unique(long_data$Group))]# Axis labels (replace with your variable names)
+x_label <-"True"
+y_label <-"Predicted" 
+
+combined_plot <-
+  ggplot(long_data, aes(x = X, y = Y, color = legend_label, fill = legend_label)) +
+  geom_point(size = 3, alpha = 0.8, shape = 21, color = "black", stroke = 0.6) +
+  geom_smooth(
+    method = "lm", formula = y ~ x, se = TRUE,
+    alpha = 0.2, linewidth = 1.0, linetype = "dashed"  ) +
+  labs(x = x_label, y = y_label) +
+  Main_theme +
+  scale_color_manual(values = sci_colors) +
+  scale_fill_manual(values = sci_colors) +
+  geom_text(
+    data = cor_data,
+    aes(x = x_pos, y = y_pos, label = stat_label, color = Group),) +
+  ylim(expanded_y_range) +
+  xlim(expanded_x_range) +
+  theme(plot.margin = margin(0, 0, 0, 0))
+
+# Top X-axis density plot
+x_density <- ggplot(long_data, aes(x = X, fill = legend_label, color = legend_label)) +
+  geom_density(alpha = 0.5, linewidth = 0.8) +  no_axis_theme +
+  scale_fill_manual(values = sci_colors) +
+  scale_color_manual(values = sci_colors) +
+  xlim(expanded_x_range) +
+  ylim(c(0, max(get_density_range(long_data, "X")[2], get_density_range(long_data, "Y")[2]) * 1.1)) +
+  theme(plot.margin = margin(0, 0, -5, 0))
+# Right Y-axis density plot (flipped with coord_flip())
+y_density <- ggplot(long_data, aes(x = Y, fill = legend_label, color = legend_label)) +
+  geom_density(alpha = 0.5, linewidth = 0.8) +
+  no_axis_theme +
+  scale_fill_manual(values = sci_colors) +
+  scale_color_manual(values = sci_colors) +
+  xlim(expanded_y_range) +
+  ylim(c(0, max(get_density_range(long_data, "X")[2], get_density_range(long_data, "Y")[2]) * 1.1)) +
+  coord_flip() +
+  theme(plot.margin = margin(0, 0, 0, -5)) 
+
+create_final_plot <- function(top_plot, right_plot) {
+  layout <- top_plot + plot_spacer() + 
+    combined_plot + right_plot +
+    plot_layout(
+      ncol = 2, nrow = 2,
+      widths = c(4, 1),  # Main plot:right plot = 4:1
+      heights = c(1, 4)  # Top plot:main plot = 1:4
+    )  
+  wrap_elements(full = layout) +
+    theme(plot.margin = margin(5, 5, 5, 5))
+}
+
+final_plot_density <- create_final_plot(x_density, y_density)
+final_plot_density
