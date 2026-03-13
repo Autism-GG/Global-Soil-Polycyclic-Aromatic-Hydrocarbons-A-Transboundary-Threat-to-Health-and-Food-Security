@@ -1,0 +1,321 @@
+import os
+import gc
+import math
+import warnings
+import argparse
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.warp import Resampling
+from rasterio.vrt import WarpedVRT
+from rasterio.windows import Window
+from joblib import load
+from tqdm.auto import tqdm
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+
+def main():
+    """Raster prediction main program - fully embedded version"""
+
+    # ==================== Argument parsing ====================
+    parser = argparse.ArgumentParser(description="Prediction")
+    parser.add_argument("--model_path", type=str,
+                        default="final_model.joblib",
+                        help="Path to trained model")
+    parser.add_argument("--data_root", type=str, default="XXX",
+                        help="Root directory of raster data")
+    parser.add_argument("--out_dir", type=str, default="XXX",
+                        help="Output directory")
+    parser.add_argument("--chunk_size", type=int, default=1_000_000,
+                        help="Number of pixels per chunk (reduce if out of memory)")
+    parser.add_argument("--resampling_nearest", type=str, default="",
+                        help="Variable names using nearest neighbor resampling, comma-separated")
+    args = parser.parse_args()
+
+    # ==================== Environment configuration ====================
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("GDAL_CACHEMAX", "512")
+
+    plot_dir = os.path.join(args.out_dir, "plots")
+    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # ==================== Load model ====================
+    print(f"\n[LOAD] Loading model: {args.model_path}")
+    if not os.path.exists(args.model_path):
+        raise FileNotFoundError(f"Model file not found: {args.model_path}")
+
+    model_artifact = load(args.model_path)
+    model = model_artifact["model"]
+    scaler = model_artifact["scaler"]
+    y_transformer = model_artifact["y_transformer"]
+    feat_names = model_artifact["feat_names"]
+    base_keep2 = model_artifact["base_keep2"]
+    inter_cols = model_artifact["inter_cols"]
+
+    print(f"[OK] Model loaded successfully")
+    print(f"[INFO] Number of features: {len(feat_names)}")
+    print(f"[INFO] Base variables: {len(base_keep2)}")
+
+    # ==================== Build raster paths ====================
+    print(f"\n[SCAN] Scanning raster files: {args.data_root}")
+
+    # Scan all .tif files in folder
+    raster_dir = os.path.join(args.data_root, "Total")
+    if not os.path.exists(raster_dir):
+        raise FileNotFoundError(f"Raster data directory not found: {raster_dir}")
+
+    raster_paths = {}
+    tif_files = [f for f in os.listdir(raster_dir) if f.lower().endswith('.tif')]
+
+    for filename in tif_files:
+        var_name = os.path.splitext(filename)[0]  # Remove .tif extension as variable name
+        file_path = os.path.join(raster_dir, filename)
+        raster_paths[var_name] = file_path
+
+    print(f"[DIR] Found {len(raster_paths)} raster files")
+
+    if len(raster_paths) == 0:
+        raise FileNotFoundError(f"No .tif files found in directory: {raster_dir}")
+
+    # Check if all required base variables exist
+    missing_vars = [v for v in base_keep2 if v not in raster_paths]
+    if missing_vars:
+        print(f"[WARN] Variables required by model: {base_keep2}")
+        print(f"[WARN] Variables found: {sorted(raster_paths.keys())}")
+        raise RuntimeError(f"Missing raster files for training base variables:\n" + ", ".join(missing_vars))
+
+    print(f"[OK] Matched {len(base_keep2)} required raster files")
+
+    # ==================== Resampling configuration ====================
+    resampling_map = {}
+    if args.resampling_nearest:
+        nearest_vars = [v.strip() for v in args.resampling_nearest.split(",") if v.strip()]
+        for name in nearest_vars:
+            resampling_map[name] = Resampling.nearest
+        print(f"[CONFIG] The following variables will use nearest neighbor resampling: {nearest_vars}")
+
+    # ==================== Build reference coordinate system and VRTs ====================
+    print(f"\n[START] Starting raster prediction...")
+    ref_var = base_keep2[0] if base_keep2 else list(raster_paths.keys())[0]
+    ref_path = raster_paths[ref_var]
+    print(f"[SCAN] Using {ref_var} as reference raster: {os.path.basename(ref_path)}")
+
+    with rasterio.open(ref_path) as ref_src:
+        ref_crs = ref_src.crs
+        ref_transform = ref_src.transform
+        ref_width = ref_src.width
+        ref_height = ref_src.height
+
+    # Create WarpedVRT for all variables
+    vrts = {}
+    base_vars = sorted(set(base_keep2) & set(raster_paths.keys()))
+
+    for name in tqdm(base_vars, desc="Creating VRTs", leave=False, ncols=100, colour='green'):
+        path = raster_paths[name]
+        try:
+            src = rasterio.open(path)
+            resampling = resampling_map.get(name, Resampling.bilinear)
+            vrt = WarpedVRT(src, crs=ref_crs, transform=ref_transform,
+                            width=ref_width, height=ref_height, resampling=resampling)
+            vrts[name] = vrt
+        except Exception as e:
+            print(f"[WARN] Failed to create VRT for {name}: {e}")
+            try:
+                vrts[name] = rasterio.open(path)
+            except Exception as e2:
+                raise RuntimeError(f"Cannot open raster {name}: {e2}")
+
+    print(f"[SCAN] Aligning to reference grid: {ref_width}×{ref_height}, CRS={str(ref_crs)}")
+
+    # ==================== Core raster prediction process ====================
+    out_map = os.path.join(args.out_dir, "Map.tif")
+
+    profile = {
+        "driver": "GTiff", "dtype": rasterio.float32, "count": 1,
+        "width": ref_width, "height": ref_height, "crs": str(ref_crs),
+        "transform": ref_transform, "tiled": True,
+        "blockxsize": min(1024, ref_width), "blockysize": min(1024, ref_height),
+        "compress": "lzw", "bigtiff": "IF_NEEDED", "nodata": np.nan
+    }
+
+    # Calculate tile size
+    side = int(math.sqrt(max(65536, min(args.chunk_size, 4_194_304))))
+    tile = max(256, min(2048, side, ref_width, ref_height))
+
+    need = set(feat_names)
+
+    with rasterio.Env(GDAL_CACHEMAX=512):
+        with rasterio.open(out_map, "w", **profile) as dst:
+            rows = list(range(0, ref_height, tile))
+            cols = list(range(0, ref_width, tile))
+            pbar = tqdm(total=len(rows) * len(cols), desc="Reading & aligning rasters",
+                        ncols=100, colour='green')
+
+            for r0 in rows:
+                h = min(tile, ref_height - r0)
+                for c0 in cols:
+                    w = min(tile, ref_width - c0)
+                    win = Window(c0, r0, w, h)
+
+                    # Read base variable windows
+                    base_cols_data = {}
+                    base_mask_union = None
+
+                    for name in base_vars:
+                        arr = vrts[name].read(1, window=win, out_dtype="float32", masked=True)
+                        if base_mask_union is None:
+                            base_mask_union = arr.mask.copy()
+                        else:
+                            base_mask_union = base_mask_union | arr.mask
+                        base_cols_data[name] = np.ma.filled(arr, np.nan).reshape(-1)
+
+                    base_df = pd.DataFrame(base_cols_data)
+
+                    # Valid pixel filtering
+                    mask_valid = (~base_mask_union.reshape(-1)) & \
+                                 np.all(np.isfinite(base_df.values), axis=1)
+                    n_valid = int(mask_valid.sum())
+
+                    if n_valid == 0:
+                        dst.write(np.full((h, w), np.nan, dtype=np.float32), 1, window=win)
+                        pbar.update(1)
+                        continue
+
+                    # Derive features on demand
+                    feats = {}
+                    for c in base_vars:
+                        x = base_df[c]
+                        if f"{c}__log1p" in need:
+                            feats[f"{c}__log1p"] = np.log1p(np.abs(x))
+                        if f"{c}__slog1p" in need or f"{c}__signed_log1p" in need:
+                            signed_log = np.sign(x) * np.log1p(np.abs(x))
+                            if f"{c}__slog1p" in need:
+                                feats[f"{c}__slog1p"] = signed_log
+                            if f"{c}__signed_log1p" in need:
+                                feats[f"{c}__signed_log1p"] = signed_log
+                        if f"{c}__sqrt" in need:
+                            feats[f"{c}__sqrt"] = np.sqrt(np.clip(x, 0, None) + 1e-9)
+                        if f"{c}__sq" in need:
+                            feats[f"{c}__sq"] = x * x
+
+                    # Interaction features
+                    if len(inter_cols) >= 2:
+                        for i in range(len(inter_cols)):
+                            for j in range(i + 1, len(inter_cols)):
+                                c1, c2 = inter_cols[i], inter_cols[j]
+                                name_ij = f"{c1}__x__{c2}"
+                                if (name_ij in need) and (c1 in base_df.columns) and \
+                                        (c2 in base_df.columns):
+                                    feats[name_ij] = base_df[c1] * base_df[c2]
+
+                    feat_df = pd.concat([base_df, pd.DataFrame(feats)], axis=1)
+
+                    # Align feature columns
+                    missing = [c for c in feat_names if c not in feat_df.columns]
+                    if missing:
+                        for v in vrts.values():
+                            v.close()
+                        raise RuntimeError(f"Missing columns in raster features: {missing[:10]} (total {len(missing)})")
+
+                    X_full = feat_df[feat_names]
+                    X_valid = X_full.loc[mask_valid]
+
+                    if scaler is not None:
+                        X_valid = pd.DataFrame(scaler.transform(X_valid),
+                                               columns=feat_names, index=X_valid.index)
+
+                    # Batch prediction
+                    y_tile = np.full((h * w,), np.float32(np.nan), dtype=np.float32)
+                    valid_idx = X_valid.index.values
+                    batch = max(100_000, min(1_500_000, args.chunk_size))
+
+                    for s in range(0, n_valid, batch):
+                        e = min(s + batch, n_valid)
+                        part_idx = valid_idx[s:e]
+                        X_batch = X_valid.loc[part_idx].values
+                        y_batch = model.predict(X_batch).astype("float32", copy=False)
+
+                        if y_transformer is not None:
+                            y_batch = y_transformer.inverse_transform(
+                                y_batch.reshape(-1, 1)).ravel().astype("float32")
+
+                        y_tile[part_idx] = y_batch
+
+                    dst.write(y_tile.reshape(h, w), 1, window=win)
+
+                    # Memory cleanup
+                    del base_cols_data, base_df, feats, feat_df, X_full, X_valid
+                    del y_tile, valid_idx
+                    gc.collect()
+                    pbar.update(1)
+
+            pbar.close()
+
+    # Close VRTs
+    for v in vrts.values():
+        try:
+            ds = v.src_dataset
+            v.close()
+            ds.close()
+        except:
+            try:
+                v.close()
+            except:
+                pass
+
+    print(f"[MAP] Raster prediction completed: {os.path.abspath(out_map)}")
+
+    # ==================== Visualization: Quick preview ====================
+    print(f"\n[VIZ] Generating visualization plots...")
+
+    with rasterio.open(out_map) as src:
+        arr = src.read(1)
+
+    H, W = arr.shape
+    scale = max(H, W) / 2000.0
+    if scale > 1:
+        step = int(np.ceil(scale))
+        arr_vis = arr[::step, ::step]
+    else:
+        arr_vis = arr
+
+    plt.figure(figsize=(7, 6))
+    im = plt.imshow(arr_vis, cmap="coolwarm", origin="upper")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.title("Prediction Map (preview)")
+    plt.axis("off")
+    plt.tight_layout()
+    quicklook_path = os.path.join(plot_dir, "map_quicklook.png")
+    plt.savefig(quicklook_path, dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"[SAVE] Saved: {quicklook_path}")
+
+    # ==================== Visualization: Histogram ====================
+    with rasterio.open(out_map) as src:
+        arr = src.read(1).astype(float)
+
+    vals = arr[np.isfinite(arr)]
+    plt.figure(figsize=(7, 4))
+    plt.hist(vals, bins=60, alpha=0.85)
+    plt.xlabel("Predicted Value")
+    plt.ylabel("Frequency")
+    plt.title("Prediction Distribution (pixels)")
+    plt.tight_layout()
+    hist_path = os.path.join(plot_dir, "map_hist.png")
+    plt.savefig(hist_path, dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"[SAVE] Saved: {hist_path}")
+
+
+if __name__ == "__main__":
+    main()
