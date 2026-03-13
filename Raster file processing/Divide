@@ -1,0 +1,42 @@
+import rasterio
+import numpy as np
+import os
+
+def divide_rasters(path_numerator, path_denominator, output_path):
+    """
+    path_numerator: Path to numerator raster (A)
+    path_denominator: Path to denominator raster (B)
+    output_path: Path for output result (A/B)
+    """
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    with rasterio.open(path_numerator) as src1:
+        data1 = src1.read(1).astype(np.float32)
+        meta = src1.meta
+
+    with rasterio.open(path_denominator) as src2:
+        data2 = src2.read(1).astype(np.float32)
+
+    # Handle division by zero
+    # Logic: if denominator is not 0, perform division; otherwise fill with np.nan (or your specified NoData value)
+    result = np.where(data2 != 0, data1 / data2, np.nan)
+
+    # Update metadata to float32 type and set nodata value
+    meta.update(dtype=rasterio.float32, count=1, nodata=np.nan)
+
+    with rasterio.open(output_path, 'w', **meta) as dst:
+        dst.write(result, 1)
+
+    print(f"Division calculation completed! Result saved to: {output_path}")
+
+# --- Path settings ---
+if __name__ == "__main__":
+    # Modify paths according to your actual situation
+    file_a = 'XXX.tif'
+    file_b = 'XXX.tif'
+    file_out = 'XXX.tif'
+
+    divide_rasters(file_a, file_b, file_out)
