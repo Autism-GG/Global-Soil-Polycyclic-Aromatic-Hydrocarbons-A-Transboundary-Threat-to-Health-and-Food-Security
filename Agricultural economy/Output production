@@ -1,0 +1,62 @@
+import pandas as pd
+import numpy as np
+import rasterio
+from scipy.interpolate import griddata, NearestNDInterpolator
+
+# 1. Load Excel data
+df = pd.read_excel('XXX.xlsx')
+points_lon = df['LON'].values
+points_lat = df['LAT'].values
+ratios = df['PAHs_Con'].values
+points = np.vstack((points_lon, points_lat)).T
+
+# 2. Load original yield TIF file
+with rasterio.open('XXX.tif') as src:
+    yield_data = src.read(1)
+    transform = src.transform
+    crs = src.crs
+    width = src.width
+    height = src.height
+    meta = src.meta.copy() # Copy metadata for later saving
+
+    # Create grid coordinates (flattened to save memory)
+    cols, rows = np.meshgrid(np.arange(width), np.arange(height))
+    # Get longitude and latitude for all pixels directly
+    lons_1d, lats_1d = rasterio.transform.xy(transform, rows.flatten(), cols.flatten())
+    target_coords = np.vstack((lons_1d, lats_1d)).T
+
+# 3. Spatial interpolation (key to solving memory overflow)
+print("Performing linear interpolation...")
+# Use linear instead of Rbf, significantly reducing memory usage
+interp_ratio_1d = griddata(points, ratios, target_coords, method='linear')
+
+# 4. Handle edge NaN values
+# Linear interpolation cannot handle areas outside the sample point convex hull, use nearest neighbor to fill
+if np.isnan(interp_ratio_1d).any():
+    print("Filling edge invalid values...")
+    nearest_interp = NearestNDInterpolator(points, ratios)
+    mask = np.isnan(interp_ratio_1d)
+    interp_ratio_1d[mask] = nearest_interp(target_coords[mask])
+
+# Reshape 1D results back to 2D grid shape
+interp_ratio_grid = interp_ratio_1d.reshape((height, width))
+
+# 5. Calculate impacted yield
+# Ensure NoData values from original TIF are considered in calculation
+final_yield = yield_data * interp_ratio_grid
+if src.nodata is not None:
+    final_yield[yield_data == src.nodata] = src.nodata
+
+# 6. Save results as new TIF
+# Update metadata to ensure consistent data type
+meta.update({
+    "dtype": 'float32',
+    "count": 1,
+    "nodata": src.nodata
+})
+
+output_path = 'XXX.tif'
+with rasterio.open(output_path, 'w', **meta) as dst:
+    dst.write(final_yield.astype(np.float32), 1)
+
+print(f"Processing complete. Results saved to: {output_path}")
